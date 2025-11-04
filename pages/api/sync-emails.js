@@ -79,7 +79,14 @@ export default async function handler(req, res) {
     }
 
     res.status(200).json({ ok: true, inserted_count: inserted.length, inserted });
+  } export default async function handler(req, res) {
+  try {
+    // ... your sync logic ...
+
+    return res.status(200).json({ ok: true, inserted_count: inserted.length, inserted });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
   }
+}
+
 }
