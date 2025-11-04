@@ -12,18 +12,15 @@ function getOAuthClient() {
   return oAuth2Client;
 }
 
-/** Robust INR parser: INR/₹/Rs, 1,23,456.78 etc. */
+/** INR parser: INR/₹/Rs, 1,23,456.78 etc. */
 function parseAmountStr(s) {
   if (!s) return null;
-  // keep digits, dots, commas; drop everything else
-  const cleaned = String(s).replace(/[^0-9.,]/g, "");
-  // normalize 1,23,456.78 -> remove commas, keep decimal
-  const normalized = cleaned.replace(/,/g, "");
+  const normalized = String(s).replace(/[^0-9.,]/g, "").replace(/,/g, "");
   const n = parseFloat(normalized);
   return Number.isFinite(n) ? n : null;
 }
 
-/** Light HTML -> text */
+/** Minimal HTML -> text */
 function htmlToText(html) {
   return html
     .replace(/<br\s*\/?>/gi, "\n")
@@ -63,36 +60,46 @@ function extractBodyAsText(payload) {
 const INR = String.raw`(?:INR|₹|Rs\.?)\s*`;
 const AMOUNT = String.raw`([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)`;
 
-// Strict patterns tailored to your sample
+/** Virtual-account credit (from your “Virtual Code … has been credited …” mails) */
 const RE_VIRTUAL_1 = new RegExp(`amount\\s+of\\s+${INR}${AMOUNT}`, "i");
 const RE_VIRTUAL_2 = new RegExp(`${INR}${AMOUNT}\\s+has\\s+been\\s+credited\\s+to\\s+Virtual\\s+Code`, "i");
 const RE_VIRTUAL_3 = new RegExp(`credited.*?${INR}${AMOUNT}`, "i");
 
-// Ref after "vide XXXXX..." (first token with letters/digits, 6–32 chars)
-const RE_REF_VIDE = /\bvide\s+([A-Za-z0-9][A-Za-z0-9/_-]{5,32})\b/i;
-
-// Indifi deduction / bank credit (looser)
+/** Indifi deduction (EMI/fees) */
 const RE_DEDUCT = new RegExp(`(?:EMI\\s*(?:deduction|deducted)|deducted|debited?)\\D*${INR}${AMOUNT}`, "i");
-const RE_BANK   = new RegExp(`(?:transferred|credited)\\s+.*?\\bbank\\b.*?${INR}${AMOUNT}`, "i");
 
+/** Release-to-bank emails (your new sample) */
+const RE_RELEASE_AMOUNT = new RegExp(
+  `amount\\s+of\\s+${INR}${AMOUNT}[^\\n]*?released\\s+to\\s+the\\s+registered\\s+bank\\s+account`,
+  "i"
+);
+// Accepts “vide ABC123…”
+const RE_RELEASE_REF = /\bvide\s+([A-Za-z0-9][A-Za-z0-9/_-]{5,32})\b/i;
+
+/** Fallback “bank credited/transferred … INR …” */
+const RE_BANK_GENERIC = new RegExp(`(?:transferred|credited)\\s+.*?\\bbank\\b.*?${INR}${AMOUNT}`, "i");
+
+/** Safe header getter */
 function headerValue(headers, name) {
   return (headers.find(h => h.name === name) || {}).value || "";
 }
 
+/** Search query (includes sender + phrases + subjects). Override with ?q= */
 function buildQuery({ qOverride, afterEpoch }) {
   if (qOverride) return `${qOverride} after:${afterEpoch}`;
   const parts = [
     'from:info@indificapital.com',
     '"Virtual Code"',
-    '(subject:"Payment release successful")',
-    '(subject:"Payment release succesfull")',
-    '(subject:"Payment Received in virtual account")'
+    '"Payment release successful"',
+    '"Payment release succesfull"',
+    '"Payment Received in virtual account"'
   ];
   return parts.join(" OR ") + ` after:${afterEpoch}`;
 }
 
 export default async function handler(req, res) {
   try {
+    // Backfill window (default 120d; cap 1..3650)
     const days = Math.max(1, Math.min(3650, parseInt(req.query.days || "120", 10)));
     const since = new Date(Date.now() - days * 86400000);
     const afterEpoch = Math.floor(since.getTime() / 1000);
@@ -110,10 +117,7 @@ export default async function handler(req, res) {
 
     do {
       const list = await gmail.users.messages.list({
-        userId: "me",
-        q,
-        maxResults: 100,
-        pageToken
+        userId: "me", q, maxResults: 100, pageToken
       });
 
       const messages = list.data.messages || [];
@@ -132,28 +136,42 @@ export default async function handler(req, res) {
           const headers = payload.headers || [];
 
           const subject = headerValue(headers, "Subject");
-          const from    = headerValue(headers, "From");
           const dateHdr = headerValue(headers, "Date");
           const receivedAt = dateHdr ? new Date(dateHdr).toISOString() : new Date().toISOString();
 
           const bodyText = extractBodyAsText(payload);
 
-          // Virtual credit extraction (try specific -> generic)
+          // --- Extract values depending on mail type ---
+          let virtualAmount = null;
+          let indifiDeduction = null;
+          let bankCredit = null;
+          let transactionRef = null;
+
+          // Virtual-account credits
           const v1 = bodyText.match(RE_VIRTUAL_1);
           const v2 = v1 ? null : bodyText.match(RE_VIRTUAL_2);
           const v3 = v1 || v2 ? null : bodyText.match(RE_VIRTUAL_3);
-          const virtualAmount = parseAmountStr((v1?.[1] || v2?.[1] || v3?.[1]) || null);
+          virtualAmount = parseAmountStr((v1?.[1] || v2?.[1] || v3?.[1]) || null);
 
-          // Deduction & bank credit (if such mails exist)
+          // Indifi deductions
           const d1 = bodyText.match(RE_DEDUCT);
-          const b1 = bodyText.match(RE_BANK);
-          const indifiDeduction = parseAmountStr(d1?.[1] || null);
-          const bankCredit      = parseAmountStr(b1?.[1] || null);
+          indifiDeduction = parseAmountStr(d1?.[1] || null);
 
-          // Reference (prefer after "vide ...")
-          const refMatch = bodyText.match(RE_REF_VIDE) ||
-                           bodyText.match(/\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]{6,32})\b/i);
-          const transactionRef = refMatch?.[1] || null;
+          // Release-to-bank: prefer this strong pattern for your exact mail
+          const rAmt = bodyText.match(RE_RELEASE_AMOUNT);
+          if (rAmt) {
+            bankCredit = parseAmountStr(rAmt[1]);
+          } else {
+            // fallback generic
+            const b1 = bodyText.match(RE_BANK_GENERIC);
+            bankCredit = parseAmountStr(b1?.[1] || null);
+          }
+
+          // Reference number (vide … or TXN/Ref)
+          const ref1 = bodyText.match(RE_RELEASE_REF);
+          transactionRef =
+            ref1?.[1] ||
+            (bodyText.match(/\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]{6,32})\b/i)?.[1] || null);
 
           const source =
             /virtual code/i.test(bodyText) || /virtual account/i.test(subject)
