@@ -17,76 +17,106 @@ function parseAmount(s) {
   return n ? parseFloat(n) : null;
 }
 
+function htmlToText(html) {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
+
+function extractBody(payload) {
+  let text = "";
+  const stack = [payload];
+  while (stack.length) {
+    const part = stack.pop();
+    if (!part) continue;
+    if (part.parts) stack.push(...part.parts);
+    const body = part.body?.data ? Buffer.from(part.body.data, "base64").toString("utf-8") : "";
+    if (part.mimeType === "text/plain" && body) text += body + "\n";
+    if (part.mimeType === "text/html" && body) text += htmlToText(body) + "\n";
+  }
+  if (!text && payload?.body?.data) {
+    text = Buffer.from(payload.body.data, "base64").toString("utf-8");
+  }
+  return text;
+}
+
 export default async function handler(req, res) {
   try {
     const auth = getOAuthClient();
     const gmail = google.gmail({ version: "v1", auth });
 
-    const q = 'subject:("Payment Received in virtual account" OR "Payment release successful")';
+    // Wider query; adjust as needed
+    const q = [
+      '(subject:"Payment Received in virtual account")',
+      '(subject:"Payment release successful")',
+      '(subject:"Payment release succesfull")', // if typo exists in real mails
+    ].join(" OR ");
+
     const listRes = await gmail.users.messages.list({ userId: "me", q, maxResults: 50 });
     const messages = listRes.data.messages || [];
     const inserted = [];
 
     for (const m of messages) {
+      // skip duplicates
       const { data: exists } = await supabaseAdmin
-        .from("payments").select("id").eq("email_id", m.id).limit(1);
+        .from("payments")
+        .select("id")
+        .eq("email_id", m.id)
+        .limit(1);
       if (exists && exists.length) continue;
 
       const msgRes = await gmail.users.messages.get({ userId: "me", id: m.id, format: "full" });
-
-      const headers = msgRes.data.payload.headers || [];
-      const subject = (headers.find(h=>h.name==="Subject")||{}).value || "";
-      const dateHeader = (headers.find(h=>h.name==="Date")||{}).value;
+      const payload = msgRes.data.payload;
+      const headers = payload.headers || [];
+      const subject = (headers.find(h => h.name === "Subject") || {}).value || "";
+      const dateHeader = (headers.find(h => h.name === "Date") || {}).value;
       const receivedAt = dateHeader ? new Date(dateHeader).toISOString() : new Date().toISOString();
 
-      let body = "";
-      const stack = [msgRes.data.payload];
-      while (stack.length) {
-        const part = stack.pop();
-        if (!part) continue;
-        if (part.parts) stack.push(...part.parts);
-        if (part.mimeType === "text/plain" && part.body?.data) {
-          body += Buffer.from(part.body.data, "base64").toString("utf-8") + "\n";
-        }
-      }
-      if (!body && msgRes.data.payload?.body?.data) {
-        body = Buffer.from(msgRes.data.payload.body.data, "base64").toString("utf-8");
-      }
+      const bodyText = extractBody(payload);
 
-      const virtualMatch = body.match(/credited.*?virtual account.*?(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i)
-        || subject.match(/(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i);
-      const indifiMatch = body.match(/EMI(?: deduction| deducted)?.*?(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i)
-        || body.match(/deducted.*?(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i);
-      const bankMatch = body.match(/(transferred|credited).*?bank.*?(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i);
-      const txnMatch = body.match(/\b(?:Ref|Reference|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9-_.]+)/i);
+      const virtualMatch =
+        bodyText.match(/credited.*?virtual account.*?(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i) ||
+        subject.match(/(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i);
+      const indifiMatch =
+        bodyText.match(/EMI(?: deduction| deducted)?.*?(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i) ||
+        bodyText.match(/(?:deducted|debit).*?(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i);
+      const bankMatch =
+        bodyText.match(/(transferred|credited).*?bank.*?(?:INR|Rs\.?)\s?([\d,]+(?:\.\d{1,2})?)/i);
+      const txnMatch =
+        bodyText.match(/\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]+)/i);
 
       const row = {
         email_id: m.id,
         received_at: receivedAt,
-        source: subject.includes("virtual account") ? "virtual_account"
-              : subject.includes("release") ? "indifi_release" : "email",
+        source: subject.toLowerCase().includes("virtual account")
+          ? "virtual_account"
+          : subject.toLowerCase().includes("release")
+          ? "indifi_release"
+          : "email",
         transaction_ref: txnMatch?.[1] || null,
         virtual_amount: parseAmount(virtualMatch?.[1] || null),
         indifi_deduction: parseAmount(indifiMatch?.[1] || null),
         bank_credit: parseAmount(bankMatch?.[2] || null),
         raw_subject: subject,
-        raw_body: body,
-        parsed: true
+        raw_body: bodyText,
+        parsed: true,
       };
 
       const { error } = await supabaseAdmin.from("payments").insert([row]);
       if (!error) inserted.push(m.id);
     }
 
-    res.status(200).json({ ok: true, inserted_count: inserted.length, inserted });
-  } export default async function handler(req, res) {
-  try {
-    // ... your sync logic ...
-
     return res.status(200).json({ ok: true, inserted_count: inserted.length, inserted });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
-}
-
 }
