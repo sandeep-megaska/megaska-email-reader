@@ -1,30 +1,33 @@
-// pages/api/sync-emails.js
 import { google } from "googleapis";
 import { supabaseAdmin } from "./_supabase";
 
-/** Build OAuth2 client from env */
+/** OAuth client */
 function getOAuthClient() {
   const oAuth2Client = new google.auth.OAuth2(
     process.env.GMAIL_CLIENT_ID,
     process.env.GMAIL_CLIENT_SECRET,
-    "http://localhost" // not used in refresh flow
+    "http://localhost"
   );
   oAuth2Client.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
   return oAuth2Client;
 }
 
-/** Parse "INR 12,345.67" / "Rs. 12,345" / "₹12,345" → Number */
-function parseAmount(s) {
+/** Robust INR parser: INR/₹/Rs, 1,23,456.78 etc. */
+function parseAmountStr(s) {
   if (!s) return null;
-  const n = String(s).replace(/[^\d.]/g, "");
-  return n ? parseFloat(n) : null;
+  // keep digits, dots, commas; drop everything else
+  const cleaned = String(s).replace(/[^0-9.,]/g, "");
+  // normalize 1,23,456.78 -> remove commas, keep decimal
+  const normalized = cleaned.replace(/,/g, "");
+  const n = parseFloat(normalized);
+  return Number.isFinite(n) ? n : null;
 }
 
-/** Minimal HTML → text (preserve line breaks) */
+/** Light HTML -> text */
 function htmlToText(html) {
   return html
     .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|tr|li)>/gi, "\n")
+    .replace(/<\/(p|div|tr|li|td|th)>/gi, "\n")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<[^>]+>/g, "")
@@ -32,10 +35,12 @@ function htmlToText(html) {
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-/** Walk Gmail payload → concatenated text */
+/** Walk Gmail payload -> text */
 function extractBodyAsText(payload) {
   let text = "";
   const stack = [payload];
@@ -45,6 +50,7 @@ function extractBodyAsText(payload) {
     if (part.parts) stack.push(...part.parts);
 
     const raw = part.body?.data ? Buffer.from(part.body.data, "base64").toString("utf-8") : "";
+
     if (part.mimeType === "text/plain" && raw) text += raw + "\n";
     if (part.mimeType === "text/html"  && raw) text += htmlToText(raw) + "\n";
   }
@@ -54,22 +60,32 @@ function extractBodyAsText(payload) {
   return text.trim();
 }
 
+const INR = String.raw`(?:INR|₹|Rs\.?)\s*`;
+const AMOUNT = String.raw`([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)`;
+
+// Strict patterns tailored to your sample
+const RE_VIRTUAL_1 = new RegExp(`amount\\s+of\\s+${INR}${AMOUNT}`, "i");
+const RE_VIRTUAL_2 = new RegExp(`${INR}${AMOUNT}\\s+has\\s+been\\s+credited\\s+to\\s+Virtual\\s+Code`, "i");
+const RE_VIRTUAL_3 = new RegExp(`credited.*?${INR}${AMOUNT}`, "i");
+
+// Ref after "vide XXXXX..." (first token with letters/digits, 6–32 chars)
+const RE_REF_VIDE = /\bvide\s+([A-Za-z0-9][A-Za-z0-9/_-]{5,32})\b/i;
+
+// Indifi deduction / bank credit (looser)
+const RE_DEDUCT = new RegExp(`(?:EMI\\s*(?:deduction|deducted)|deducted|debited?)\\D*${INR}${AMOUNT}`, "i");
+const RE_BANK   = new RegExp(`(?:transferred|credited)\\s+.*?\\bbank\\b.*?${INR}${AMOUNT}`, "i");
+
 function headerValue(headers, name) {
   return (headers.find(h => h.name === name) || {}).value || "";
 }
 
-/** Build a broad query; allow override via ?q= */
 function buildQuery({ qOverride, afterEpoch }) {
   if (qOverride) return `${qOverride} after:${afterEpoch}`;
-  // Subjects we already had + sender + "Virtual Code" phrase
   const parts = [
-    // Indifi virtual-account credit emails
     'from:info@indificapital.com',
-    '"Virtual Code"',                       // phrase in the body/subject
-    // Release emails (keep prior variants)
+    '"Virtual Code"',
     '(subject:"Payment release successful")',
     '(subject:"Payment release succesfull")',
-    // Older text some senders use
     '(subject:"Payment Received in virtual account")'
   ];
   return parts.join(" OR ") + ` after:${afterEpoch}`;
@@ -77,7 +93,6 @@ function buildQuery({ qOverride, afterEpoch }) {
 
 export default async function handler(req, res) {
   try {
-    // Backfill window (default 120 days; cap 1..3650)
     const days = Math.max(1, Math.min(3650, parseInt(req.query.days || "120", 10)));
     const since = new Date(Date.now() - days * 86400000);
     const afterEpoch = Math.floor(since.getTime() / 1000);
@@ -87,7 +102,7 @@ export default async function handler(req, res) {
     const auth = getOAuthClient();
     const gmail = google.gmail({ version: "v1", auth });
 
-    let pageToken = undefined;
+    let pageToken;
     let pagesScanned = 0;
     let insertedCount = 0;
     const errors = [];
@@ -115,35 +130,31 @@ export default async function handler(req, res) {
           const msg = await gmail.users.messages.get({ userId: "me", id: m.id, format: "full" });
           const payload = msg.data.payload || {};
           const headers = payload.headers || [];
+
           const subject = headerValue(headers, "Subject");
-          const dateHeader = headerValue(headers, "Date");
-          const receivedAt = dateHeader ? new Date(dateHeader).toISOString() : new Date().toISOString();
+          const from    = headerValue(headers, "From");
+          const dateHdr = headerValue(headers, "Date");
+          const receivedAt = dateHdr ? new Date(dateHdr).toISOString() : new Date().toISOString();
 
           const bodyText = extractBodyAsText(payload);
 
-          // ====== PARSING RULES ======
-          // 1) Amount credited to virtual code
-          //    matches: "An amount of INR 8629.59 has been credited to Virtual Code ..."
-          const virtualAmountMatch =
-            bodyText.match(/amount\s+of\s+(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)/i) ||
-            bodyText.match(/(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)\s+has\s+been\s+credited\s+to\s+Virtual\s+Code/i) ||
-            bodyText.match(/credited.*?(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)/i);
+          // Virtual credit extraction (try specific -> generic)
+          const v1 = bodyText.match(RE_VIRTUAL_1);
+          const v2 = v1 ? null : bodyText.match(RE_VIRTUAL_2);
+          const v3 = v1 || v2 ? null : bodyText.match(RE_VIRTUAL_3);
+          const virtualAmount = parseAmountStr((v1?.[1] || v2?.[1] || v3?.[1]) || null);
 
-          // 2) Indifi deduction (EMI/fee)
-          const indifiDeductionMatch =
-            bodyText.match(/EMI(?:\s*deduction|\s*deducted)?.*?(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)/i) ||
-            bodyText.match(/(?:deducted|debit(?:ed)?)\s*(?:amount)?\s*(?:of)?\s*(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)/i);
+          // Deduction & bank credit (if such mails exist)
+          const d1 = bodyText.match(RE_DEDUCT);
+          const b1 = bodyText.match(RE_BANK);
+          const indifiDeduction = parseAmountStr(d1?.[1] || null);
+          const bankCredit      = parseAmountStr(b1?.[1] || null);
 
-          // 3) Net bank transfer
-          const bankCreditMatch =
-            bodyText.match(/(transferred|credited).*?bank.*?(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)/i);
+          // Reference (prefer after "vide ...")
+          const refMatch = bodyText.match(RE_REF_VIDE) ||
+                           bodyText.match(/\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]{6,32})\b/i);
+          const transactionRef = refMatch?.[1] || null;
 
-          // 4) Reference ID after "vide ..."
-          const refMatch =
-            bodyText.match(/\bvide\s+([A-Za-z0-9/_-]+)/i) ||
-            bodyText.match(/\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]+)/i);
-
-          // source tagging
           const source =
             /virtual code/i.test(bodyText) || /virtual account/i.test(subject)
               ? "virtual_account"
@@ -155,22 +166,18 @@ export default async function handler(req, res) {
             email_id: m.id,
             received_at: receivedAt,
             source,
-            transaction_ref: refMatch?.[1] || null,
-            virtual_amount: parseAmount(virtualAmountMatch?.[1] || null),
-            indifi_deduction: parseAmount(indifiDeductionMatch?.[1] || null),
-            bank_credit: parseAmount(bankCreditMatch?.[2] || null),
+            transaction_ref: transactionRef,
+            virtual_amount: virtualAmount,
+            indifi_deduction: indifiDeduction,
+            bank_credit: bankCredit,
             raw_subject: subject,
             raw_body: bodyText,
             parsed: true
           };
 
           const { error } = await supabaseAdmin.from("payments").insert([row]);
-          if (error) {
-            errors.push({ id: m.id, reason: error.message });
-          } else {
-            insertedCount++;
-            insertedIds.push(m.id);
-          }
+          if (error) errors.push({ id: m.id, reason: error.message });
+          else { insertedCount++; insertedIds.push(m.id); }
         } catch (inner) {
           errors.push({ id: m.id, reason: inner.message });
         }
@@ -178,11 +185,7 @@ export default async function handler(req, res) {
     } while (pageToken && pagesScanned < 20);
 
     return res.status(200).json({
-      ok: true,
-      inserted_count: insertedCount,
-      pages_scanned: pagesScanned,
-      q,
-      errors
+      ok: true, inserted_count: insertedCount, pages_scanned: pagesScanned, q, errors
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
