@@ -1,84 +1,78 @@
 import { supabaseAdmin } from "./_supabase";
 
 const INR = String.raw`(?:INR|₹|Rs\.?)\s*`;
-const AMOUNT = String.raw`([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)`;
+const AMT = String.raw`([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)`;
+const RE_VIRTUAL_STRICT_1 = new RegExp(`amount\\s+of\\s+${INR}${AMT}\\s+has\\s+been\\s+credited\\s+to\\s+Virtual\\s+Code`, "i");
+const RE_VIRTUAL_STRICT_2 = new RegExp(`${INR}${AMT}\\s+has\\s+been\\s+credited\\s+to\\s+Virtual\\s+Code`, "i");
+const RE_VIRTUAL_LOOSE    = new RegExp(`credited.*?${INR}${AMT}`, "i");
+const RE_RELEASE_AMOUNT   = new RegExp(`amount\\s+of\\s+${INR}${AMT}[^\\n]*?released\\s+to\\s+the\\s+registered\\s+bank\\s+account`, "i");
+const RE_BANK_GENERIC     = new RegExp(`(?:transferred|credited)\\s+.*?\\bbank\\b.*?${INR}${AMT}`, "i");
+const RE_REF_VIDE         = /\bvide\s+([A-Za-z0-9][A-Za-z0-9/_-]{5,32})\b/i;
+const RE_REF_GENERIC      = /\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]{6,32})\b/i;
+const RE_DEDUCT           = new RegExp(`(?:EMI\\s*(?:deduction|deducted)|deducted|debited?)\\D*${INR}${AMT}`, "i");
 
-const RE_VIRTUAL_1 = new RegExp(`amount\\s+of\\s+${INR}${AMOUNT}`, "i");
-const RE_VIRTUAL_2 = new RegExp(`${INR}${AMOUNT}\\s+has\\s+been\\s+credited\\s+to\\s+Virtual\\s+Code`, "i");
-const RE_VIRTUAL_3 = new RegExp(`credited.*?${INR}${AMOUNT}`, "i");
-
-const RE_DEDUCT = new RegExp(`(?:EMI\\s*(?:deduction|deducted)|deducted|debited?)\\D*${INR}${AMOUNT}`, "i");
-
-const RE_RELEASE_AMOUNT = new RegExp(
-  `amount\\s+of\\s+${INR}${AMOUNT}[^\\n]*?released\\s+to\\s+the\\s+registered\\s+bank\\s+account`,
-  "i"
-);
-const RE_RELEASE_REF = /\bvide\s+([A-Za-z0-9][A-Za-z0-9/_-]{5,32})\b/i;
-
-const RE_BANK_GENERIC = new RegExp(`(?:transferred|credited)\\s+.*?\\bbank\\b.*?${INR}${AMOUNT}`, "i");
-
-function parseAmountStr(s) {
+function parseINR(s) {
   if (!s) return null;
-  const normalized = String(s).replace(/[^0-9.,]/g, "").replace(/,/g, "");
-  const n = parseFloat(normalized);
+  const n = parseFloat(String(s).replace(/[^0-9.]/g, "").replace(/,/g, ""));
   return Number.isFinite(n) ? n : null;
 }
 
 export default async function handler(req, res) {
   const { data: rows, error } = await supabaseAdmin
     .from("payments")
-    .select("id, source, raw_body, raw_subject, virtual_amount, indifi_deduction, bank_credit, transaction_ref")
-    .or("virtual_amount.is.null,indifi_deduction.is.null,bank_credit.is.null,transaction_ref.is.null")
+    .select("id, source, raw_subject, raw_body, virtual_amount, bank_credit, indifi_deduction, transaction_ref")
     .limit(2000);
 
   if (error) return res.status(500).json({ ok: false, error: error.message });
 
   let updated = 0;
-
   for (const r of rows) {
     const body = r.raw_body || "";
     const subj = r.raw_subject || "";
+    const isVirtual = /virtual code/i.test(body) || /Payment Received in virtual account/i.test(subj);
+    const isRelease = /Payment release successful/i.test(subj) || /Payment release succesfull/i.test(subj);
 
-    // Virtual
-    let vAmt = r.virtual_amount;
-    if (vAmt == null) {
-      const v1 = body.match(RE_VIRTUAL_1);
-      const v2 = v1 ? null : body.match(RE_VIRTUAL_2);
-      const v3 = v1 || v2 ? null : body.match(RE_VIRTUAL_3);
-      vAmt = parseAmountStr((v1?.[1] || v2?.[1] || v3?.[1]) || null);
+    let virtual_amount = r.virtual_amount;
+    let bank_credit    = r.bank_credit;
+    let indifi_deduction = r.indifi_deduction;
+    let transaction_ref  = r.transaction_ref;
+
+    if (isVirtual) {
+      const m1 = body.match(RE_VIRTUAL_STRICT_1) || body.match(RE_VIRTUAL_STRICT_2) || body.match(RE_VIRTUAL_LOOSE);
+      const v = parseINR(m1?.[1] || null);
+      virtual_amount = (v != null && v >= 500) ? v : null;
+      bank_credit = null; // never from virtual mails
+    }
+    if (isRelease) {
+      const a = body.match(RE_RELEASE_AMOUNT) || body.match(RE_BANK_GENERIC);
+      const b = parseINR(a?.[1] || null);
+      bank_credit = (b != null && b >= 500) ? b : null;
+      virtual_amount = null; // never from release mails
     }
 
-    // Deduction
-    let dAmt = r.indifi_deduction;
-    if (dAmt == null) {
-      const d1 = body.match(RE_DEDUCT);
-      dAmt = parseAmountStr(d1?.[1] || null);
+    // deduction
+    if (indifi_deduction == null) {
+      const d = body.match(RE_DEDUCT);
+      const dAmt = parseINR(d?.[1] || null);
+      indifi_deduction = (dAmt != null && dAmt >= 1) ? dAmt : indifi_deduction;
     }
 
-    // Bank credit
-    let bAmt = r.bank_credit;
-    if (bAmt == null) {
-      const rAmt = body.match(RE_RELEASE_AMOUNT);
-      bAmt = parseAmountStr(rAmt?.[1] || null);
-      if (bAmt == null) {
-        const b1 = body.match(RE_BANK_GENERIC);
-        bAmt = parseAmountStr(b1?.[1] || null);
-      }
+    // ref (reject too-short tokens like "is")
+    if (!transaction_ref || transaction_ref.length < 6) {
+      const r1 = body.match(RE_REF_VIDE) || body.match(RE_REF_GENERIC);
+      const ref = r1?.[1] || null;
+      transaction_ref = ref && ref.length >= 6 ? ref : null;
     }
 
-    // Reference
-    let ref = r.transaction_ref;
-    if (ref == null) {
-      ref = (body.match(RE_RELEASE_REF)?.[1] ||
-            body.match(/\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]{6,32})\b/i)?.[1] || null);
-    }
+    const needUpdate =
+      virtual_amount !== r.virtual_amount ||
+      bank_credit !== r.bank_credit ||
+      indifi_deduction !== r.indifi_deduction ||
+      transaction_ref !== r.transaction_ref;
 
-    if (vAmt != null || dAmt != null || bAmt != null || ref != null) {
+    if (needUpdate) {
       await supabaseAdmin.from("payments").update({
-        virtual_amount: vAmt ?? r.virtual_amount,
-        indifi_deduction: dAmt ?? r.indifi_deduction,
-        bank_credit: bAmt ?? r.bank_credit,
-        transaction_ref: ref ?? r.transaction_ref
+        virtual_amount, bank_credit, indifi_deduction, transaction_ref
       }).eq("id", r.id);
       updated++;
     }
