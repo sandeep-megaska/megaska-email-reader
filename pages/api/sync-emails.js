@@ -3,23 +3,23 @@ import { supabaseAdmin } from "./_supabase";
 
 /** OAuth client */
 function getOAuthClient() {
-  const oAuth2Client = new google.auth.OAuth2(
+  const o = new google.auth.OAuth2(
     process.env.GMAIL_CLIENT_ID,
     process.env.GMAIL_CLIENT_SECRET,
     "http://localhost"
   );
-  oAuth2Client.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
-  return oAuth2Client;
+  o.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
+  return o;
 }
 
-/** INR parser: INR/₹/Rs, 1,23,456.78 etc. drops commas */
+/** INR parser (₹/INR/Rs; handles 1,23,456.78) */
 function parseINR(s) {
   if (!s) return null;
-  const n = parseFloat(String(s).replace(/[^0-9.]/g, "").replace(/,/g, ""));
+  const n = parseFloat(String(s).replace(/,/g, "").replace(/[^\d.]/g, ""));
   return Number.isFinite(n) ? n : null;
 }
 
-/** minimal HTML→text */
+/** HTML → text (light) */
 function htmlToText(html) {
   return html
     .replace(/<br\s*\/?>/gi, "\n")
@@ -28,9 +28,6 @@ function htmlToText(html) {
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<[^>]+>/g, "")
     .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
     .replace(/\s+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -44,34 +41,29 @@ function extractBodyText(payload) {
     if (part.parts) stack.push(...part.parts);
     const raw = part.body?.data ? Buffer.from(part.body.data, "base64").toString("utf-8") : "";
     if (part.mimeType === "text/plain" && raw) text += raw + "\n";
-    if (part.mimeType === "text/html" && raw) text += htmlToText(raw) + "\n";
+    if (part.mimeType === "text/html"  && raw) text += htmlToText(raw) + "\n";
   }
   if (!text && payload?.body?.data) {
     text = Buffer.from(payload.body.data, "base64").toString("utf-8");
   }
   return text.trim();
 }
+
 const INR = String.raw`(?:INR|₹|Rs\.?)\s*`;
 const AMT = String.raw`([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)`;
 
-// VIRTUAL credit emails (your sample wording)
-const RE_VIRTUAL_STRICT_1 = new RegExp(`amount\\s+of\\s+${INR}${AMT}\\s+has\\s+been\\s+credited\\s+to\\s+Virtual\\s+Code`, "i");
-const RE_VIRTUAL_STRICT_2 = new RegExp(`${INR}${AMT}\\s+has\\s+been\\s+credited\\s+to\\s+Virtual\\s+Code`, "i");
-const RE_VIRTUAL_LOOSE    = new RegExp(`credited.*?${INR}${AMT}`, "i");
+// Virtual credit (your VA email)
+const RE_VIRTUAL = new RegExp(`amount\\s+of\\s+${INR}${AMT}\\s+has\\s+been\\s+credited\\s+to\\s+Virtual\\s+Code\\s+(\\d+)`, "i");
 
-// RELEASE→bank emails (your sample wording)
-const RE_RELEASE_AMOUNT   = new RegExp(`amount\\s+of\\s+${INR}${AMT}[^\\n]*?released\\s+to\\s+the\\s+registered\\s+bank\\s+account`, "i");
+// Release to bank (your “Payment release successful” sample)
+const RE_RELEASE = new RegExp(`amount\\s+of\\s+${INR}${AMT}[^\\n]*?released\\s+to\\s+the\\s+registered\\s+bank\\s+account\\s+(.+?)\\s+on`, "i");
 
-// Reference: “vide ABC123…”, forbid “is” etc. (≥6 chars, alnum first)
-const RE_REF_VIDE = /\bvide\s+([A-Za-z0-9][A-Za-z0-9/_-]{5,32})\b/i;
-// Generic fallback
-const RE_REF_GENERIC = /\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]{6,32})\b/i;
+// Common “vide …” ref
+const RE_VIDE = /\bvide\s+([A-Za-z0-9][A-Za-z0-9/_-]{5,32})\b/i;
 
-// Indifi deduction (EMI)
-const RE_DEDUCT = new RegExp(`(?:EMI\\s*(?:deduction|deducted)|deducted|debited?)\\D*${INR}${AMT}`, "i");
-
-// Fallback “bank credited/transferred … INR …”
+// Fallbacks
 const RE_BANK_GENERIC = new RegExp(`(?:transferred|credited)\\s+.*?\\bbank\\b.*?${INR}${AMT}`, "i");
+const RE_DEDUCT = new RegExp(`(?:EMI\\s*(?:deduction|deducted)|deducted|debited?)\\D*${INR}${AMT}`, "i");
 
 function headerValue(headers, name) {
   return (headers.find(h => h.name === name) || {}).value || "";
@@ -96,106 +88,101 @@ export default async function handler(req, res) {
     const afterEpoch = Math.floor(since.getTime() / 1000);
     const q = buildQuery({ qOverride: req.query.q, afterEpoch });
 
-    const auth = getOAuthClient();
-    const gmail = google.gmail({ version: "v1", auth });
+    const gmail = google.gmail({ version: "v1", auth: getOAuthClient() });
 
-    let pageToken;
-    let pagesScanned = 0;
-    let insertedCount = 0;
+    let pageToken, insertedCount = 0, pages = 0;
     const errors = [];
 
     do {
       const list = await gmail.users.messages.list({ userId: "me", q, maxResults: 100, pageToken });
-      const messages = list.data.messages || [];
+      const msgs = list.data.messages || [];
       pageToken = list.data.nextPageToken || undefined;
-      pagesScanned++;
+      pages++;
 
-      for (const m of messages) {
+      for (const m of msgs) {
         try {
           // de-dupe
           const { data: exists } = await supabaseAdmin.from("payments").select("id").eq("email_id", m.id).limit(1);
-          if (exists && exists.length) continue;
+          if (exists?.length) continue;
 
-          const msg = await gmail.users.messages.get({ userId: "me", id: m.id, format: "full" });
-          const payload = msg.data.payload || {};
+          const full = await gmail.users.messages.get({ userId: "me", id: m.id, format: "full" });
+          const payload = full.data.payload || {};
           const headers = payload.headers || [];
+          const subject = headerValue(headers, "Subject") || "";
+          const dateHdr = headerValue(headers, "Date");
+          const received_at = dateHdr ? new Date(dateHdr).toISOString() : new Date().toISOString();
 
-          const subject   = headerValue(headers, "Subject");
-          const dateHdr   = headerValue(headers, "Date");
-          const receivedAt= dateHdr ? new Date(dateHdr).toISOString() : new Date().toISOString();
-          const bodyText  = extractBodyText(payload);
+          const body = extractBodyText(payload);
 
-          // MAIL TYPE
-          const isVirtual = /virtual code/i.test(bodyText) || /Payment Received in virtual account/i.test(subject);
-          const isRelease = /Payment release successful/i.test(subject) || /Payment release succesfull/i.test(subject);
+          // classify + extract
+          let kind = "unknown";
+          let virtual_amount = null, bank_credit = null, indifi_deduction = null;
+          let transaction_ref = null, virtual_code = null, bank_account = null;
 
-          let virtual_amount = null, bank_credit = null, indifi_deduction = null, transaction_ref = null;
-
-          if (isVirtual) {
-            const m1 = bodyText.match(RE_VIRTUAL_STRICT_1) || bodyText.match(RE_VIRTUAL_STRICT_2) || bodyText.match(RE_VIRTUAL_LOOSE);
-            const amt = parseINR(m1?.[1] || null);
-            virtual_amount = (amt != null && amt >= 500) ? amt : null; // ignore tiny/garbage
-            // ref (if present)
-            const r1 = bodyText.match(RE_REF_VIDE) || bodyText.match(RE_REF_GENERIC);
-            const ref = r1?.[1] || null;
-            // Ensure “is” etc. never pass as a ref
-            transaction_ref = ref && ref.length >= 6 ? ref : null;
-            // do NOT set bank_credit from virtual mails
-            bank_credit = null;
-          } else if (isRelease) {
-            // bank release amount
-            const rAmt = bodyText.match(RE_RELEASE_AMOUNT) || bodyText.match(RE_BANK_GENERIC);
-            const b = parseINR(rAmt?.[1] || null);
-            bank_credit = (b != null && b >= 500) ? b : null;
-            // ref
-            const r1 = bodyText.match(RE_REF_VIDE) || bodyText.match(RE_REF_GENERIC);
-            const ref = r1?.[1] || null;
-            transaction_ref = ref && ref.length >= 6 ? ref : null;
-            // do NOT set virtual_amount from release mails
-            virtual_amount = null;
-          } else {
-            // unknown type: try both, but still gate with >=500
-            const m1 = bodyText.match(RE_VIRTUAL_STRICT_1) || bodyText.match(RE_VIRTUAL_STRICT_2) || bodyText.match(RE_VIRTUAL_LOOSE);
-            const rAmt = bodyText.match(RE_RELEASE_AMOUNT) || bodyText.match(RE_BANK_GENERIC);
-            const v = parseINR(m1?.[1] || null);
-            const b = parseINR(rAmt?.[1] || null);
-            virtual_amount = (v != null && v >= 500) ? v : null;
-            bank_credit    = (b != null && b >= 500) ? b : null;
-            const r1 = bodyText.match(RE_REF_VIDE) || bodyText.match(RE_REF_GENERIC);
-            const ref = r1?.[1] || null;
-            transaction_ref = ref && ref.length >= 6 ? ref : null;
+          // Explicit EMI (if Indifi ever sends a dedicated email)
+          const d = body.match(RE_DEDUCT);
+          if (d) {
+            indifi_deduction = parseINR(d[1]);
+            kind = "emi_deduction_explicit";
           }
 
-          // optional: try to detect EMI deduction lines
-          const d1 = bodyText.match(RE_DEDUCT);
-          const d = parseINR(d1?.[1] || null);
-          indifi_deduction = (d != null && d >= 1) ? d : null;
+          // Virtual credit
+          const v = body.match(RE_VIRTUAL);
+          if (v) {
+            kind = "virtual_credit";
+            virtual_amount = parseINR(v[1]); // NOTE: in RE_VIRTUAL, first capture is amount
+            if (virtual_amount != null && virtual_amount < 500) virtual_amount = null; // ignore tiny noise
+            virtual_code = v[2] || null;      // second capture is VA code
+          }
 
-          const source = isVirtual ? "virtual_account" : isRelease ? "indifi_release" : "email";
+          // Release to bank
+          const r = body.match(RE_RELEASE);
+          if (r || /Payment release succes+ful/i.test(subject)) {
+            kind = "release_to_bank";
+            const amt = r?.[1] ? parseINR(r[1]) : null;
+            if (amt != null && amt >= 500) bank_credit = amt;
+            // bank account friendly name/last digits
+            bank_account = r?.[2]?.trim() || null;
+          } else if (!v) {
+            // generic fallback if the phrase differs; try to catch bank amount
+            const b = body.match(RE_BANK_GENERIC);
+            const bAmt = b?.[1] ? parseINR(b[1]) : null;
+            if (bAmt && bAmt >= 500) {
+              kind = "release_to_bank";
+              bank_credit = bAmt;
+            }
+          }
 
-          const row = {
+          // Ref after "vide ..."
+          const ref = body.match(RE_VIDE) ||
+                      body.match(/\b(?:Ref(?:erence)?|TXN|Transaction)\s*[:#-]?\s*([A-Za-z0-9/_-]{6,32})\b/i);
+          transaction_ref = ref?.[1] || null;
+
+          const { error } = await supabaseAdmin.from("payments").insert([{
             email_id: m.id,
-            received_at: receivedAt,
-            source,
-            transaction_ref,
+            received_at,
+            source: kind === "virtual_credit" ? "virtual_account" : (kind === "release_to_bank" ? "indifi_release" : "email"),
+            kind,
             virtual_amount,
             indifi_deduction,
             bank_credit,
+            transaction_ref,
+            virtual_code,
+            bank_account,
             raw_subject: subject,
-            raw_body: bodyText,
+            raw_body: body,
             parsed: true
-          };
+          }]);
 
-          const { error } = await supabaseAdmin.from("payments").insert([row]);
           if (error) errors.push({ id: m.id, reason: error.message });
           else insertedCount++;
         } catch (inner) {
           errors.push({ id: m.id, reason: inner.message });
         }
       }
-    } while (pageToken && pagesScanned < 20);
+    } while (pageToken && pages < 20);
 
-    return res.status(200).json({ ok: true, inserted_count: insertedCount, pages_scanned: pagesScanned, q, errors });
+    return res.status(200).json({ ok: true, inserted_count: insertedCount, pages_scanned: pages, q, errors });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
