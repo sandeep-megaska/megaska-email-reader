@@ -1,0 +1,19 @@
+{
+  "name": "megaska-email-reader",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "exceljs": "^4.4.0",
+    "googleapis": "^131.0.0",
+    "json2csv": "^6.0.0",
+    "next": "14.2.13",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}
