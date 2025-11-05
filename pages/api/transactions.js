@@ -1,0 +1,97 @@
+import { gmailClient, listMessages, loadMessage, extractBody, headerValue, getTZ } from './_gmail';
+import { parse, format } from 'date-fns';
+
+/** Utilities **/
+const INR = /INR\s*([0-9][0-9,]*\.\d{2})/i;
+const num = s => (s ? Number(String(s).replace(/,/g, '')) : 0);
+
+function ymd(date, tz) {
+  // Use Gmail internalDate (ms UTC), then render in tz through Intl (without heavy libs)
+  const d = new Date(date);
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit' });
+  // en-CA yields YYYY-MM-DD
+  return fmt.format(d);
+}
+
+function extractAmountFromText(text) {
+  const m = text && text.match(INR);
+  return m ? num(m[1]) : 0;
+}
+
+function classifyBySubject(subject) {
+  if (/Your payment is on the way/i.test(subject)) return 'AMAZON';
+  if (/Payment received in virtual account/i.test(subject)) return 'INDIFI_IN';
+  if (/Payment release successful/i.test(subject)) return 'INDIFI_OUT';
+  return 'OTHER';
+}
+
+function gmailDateQuery(start, end) {
+  // Gmail uses YYYY/MM/DD, 'after' is exclusive of that midnight; we’ll pad a day earlier to be safe.
+  const startQ = start.replaceAll('-', '/');
+  const endQ = end.replaceAll('-', '/');
+  return { startQ, endQ };
+}
+
+export default async function handler(req, res) {
+  try {
+    const tz = getTZ();
+    const { start, end } = req.query; // YYYY-MM-DD inclusive
+
+    if (!start || !end) {
+      return res.status(400).json({ error: 'Pass start and end as YYYY-MM-DD' });
+    }
+
+    const gmail = gmailClient();
+    const { startQ, endQ } = gmailDateQuery(start, end);
+
+    // Build three focused searches (faster & more precise than one big OR in practice)
+    const qAmazon = `after:${startQ} before:${endQ} subject:"Your payment is on the way"`;
+    const qIndifiIn = `after:${startQ} before:${endQ} subject:"Payment received in virtual account"`;
+    const qIndifiOut = `after:${startQ} before:${endQ} subject:"Payment release successful"`;
+
+    const [mAmazon, mIn, mOut] = await Promise.all([
+      listMessages(gmail, qAmazon, 300),
+      listMessages(gmail, qIndifiIn, 300),
+      listMessages(gmail, qIndifiOut, 300),
+    ]);
+
+    const allIds = [
+      ...mAmazon.map(m => ({ id: m.id, kind: 'AMAZON' })),
+      ...mIn.map(m => ({ id: m.id, kind: 'INDIFI_IN' })),
+      ...mOut.map(m => ({ id: m.id, kind: 'INDIFI_OUT' })),
+    ];
+
+    const rows = {};
+    const raw = [];
+
+    for (const { id, kind } of allIds) {
+      const msg = await loadMessage(gmail, id);
+      const subject = headerValue(msg.payload?.headers, 'Subject') || '';
+      const internalDate = Number(msg.internalDate); // ms
+      const dateKey = ymd(internalDate, tz);
+      const body = extractBody(msg.payload);
+      const amount = extractAmountFromText(body) || extractAmountFromText(subject);
+
+      // Keep raw for debugging
+      raw.push({ id, date: dateKey, subject, amount, kind });
+
+      if (!rows[dateKey]) rows[dateKey] = {
+        date: dateKey,
+        amazon_disbursed: 0,
+        virtual_received: 0,
+        released_to_icici: 0
+      };
+
+      if (kind === 'AMAZON') rows[dateKey].amazon_disbursed += amount;
+      if (kind === 'INDIFI_IN') rows[dateKey].virtual_received += amount;
+      if (kind === 'INDIFI_OUT') rows[dateKey].released_to_icici += amount;
+    }
+
+    // Emit sorted rows
+    const sorted = Object.values(rows).sort((a, b) => a.date.localeCompare(b.date));
+    res.status(200).json({ tz, start, end, count: sorted.length, rows: sorted, debug: { totals: allIds.length, messages: raw.length } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || 'Unexpected error' });
+  }
+}
