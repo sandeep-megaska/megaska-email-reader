@@ -12,14 +12,18 @@ export function gmailClient() {
     GMAIL_REDIRECT_URI
   } = process.env;
 
-  if (!GMAIL_CLIENT_ID || !GMAIL_CLIENT_SECRET || !GMAIL_REFRESH_TOKEN || !GMAIL_REDIRECT_URI) {
+  if (!GMAIL_CLIENT_ID || !GMAIL_CLIENT_SECRET || !GMAIL_REFRESH_TOKEN) {
     throw new Error('Missing Gmail OAuth env vars.');
   }
+
+  // Redirect URI is only needed when obtaining the refresh token.
+  // For server-to-server use with a stored refresh token we can safely default it.
+  const redirect = GMAIL_REDIRECT_URI || 'http://localhost';
 
   const oAuth2Client = new google.auth.OAuth2(
     GMAIL_CLIENT_ID,
     GMAIL_CLIENT_SECRET,
-    GMAIL_REDIRECT_URI
+    redirect
   );
   oAuth2Client.setCredentials({ refresh_token: GMAIL_REFRESH_TOKEN });
 
