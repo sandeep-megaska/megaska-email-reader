@@ -70,7 +70,7 @@ export default function Settlements() {
     <div style={{ fontFamily: 'system-ui, Arial', padding: 24, maxWidth: 1100, margin: '0 auto' }}>
       <h1>Amazon ↔ Indifi ↔ ICICI – Settlements</h1>
       <p style={{ color: '#666' }}>
-        Pick a date range to see the daily transactions details between amazon, virtual account, BGONBUY and Indifi Accounts.
+        Pick a date range to see the daily transactions details between amazon, virtual account, BIGONBUY and Indifi Accounts.
       </p>
 
       <div style={{ display:'flex', gap:12, alignItems:'center', margin:'12px 0 18px' }}>
