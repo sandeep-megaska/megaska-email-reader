@@ -1,10 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
 
 function toCSV(rows) {
-  const headers = ['date','amazon_disbursed','virtual_received','released_to_icici'];
+  const headers = ['date','amazon_disbursed','virtual_received','released_to_icici','released_to_indifi'];
   const lines = [headers.join(',')];
   for (const r of rows) {
-    lines.push([r.date, r.amazon_disbursed.toFixed(2), r.virtual_received.toFixed(2), r.released_to_icici.toFixed(2)].join(','));
+    lines.push([
+      r.date,
+      (r.amazon_disbursed || 0).toFixed(2),
+      (r.virtual_received || 0).toFixed(2),
+      (r.released_to_icici || 0).toFixed(2),
+      (r.released_to_indifi || 0).toFixed(2),
+    ].join(','));
   }
   return lines.join('\n');
 }
@@ -23,9 +29,10 @@ export default function Settlements() {
     return rows.reduce((acc, r) => {
       acc.amazon += r.amazon_disbursed || 0;
       acc.in += r.virtual_received || 0;
-      acc.out += r.released_to_icici || 0;
+      acc.outIcici += r.released_to_icici || 0;
+      acc.outIndifi += r.released_to_indifi || 0;
       return acc;
-    }, { amazon: 0, in: 0, out: 0 });
+    }, { amazon: 0, in: 0, outIcici: 0, outIndifi: 0 });
   }, [rows]);
 
   async function load() {
@@ -57,13 +64,13 @@ export default function Settlements() {
     URL.revokeObjectURL(url);
   }
 
-  useEffect(() => { load(); /* auto-load on first mount */ }, []);
+  useEffect(() => { load(); }, []); // auto-load on mount
 
   return (
     <div style={{ fontFamily: 'system-ui, Arial', padding: 24, maxWidth: 1100, margin: '0 auto' }}>
       <h1>Amazon ↔ Indifi ↔ ICICI – Settlements</h1>
       <p style={{ color: '#666' }}>
-        Pick a date range. We’ll read Gmail, match the three email types, and summarize per day.
+        Pick a date range. We’ll read Gmail, match the four email types, and summarize per day.
       </p>
 
       <div style={{ display:'flex', gap:12, alignItems:'center', margin:'12px 0 18px' }}>
@@ -97,18 +104,20 @@ export default function Settlements() {
               <th style={th}>Amazon Disbursed (INR)</th>
               <th style={th}>Received in Virtual A/c (INR)</th>
               <th style={th}>Released to ICICI (INR)</th>
+              <th style={th}>Released to Indifi (INR)</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 && !loading && (
-              <tr><td colSpan={4} style={{ padding:14, textAlign:'center', color:'#777' }}>No data</td></tr>
+              <tr><td colSpan={5} style={{ padding:14, textAlign:'center', color:'#777' }}>No data</td></tr>
             )}
             {rows.map(r => (
               <tr key={r.date}>
                 <td style={td}>{r.date}</td>
-                <td style={tdRight}>{r.amazon_disbursed?.toFixed(2) || '0.00'}</td>
-                <td style={tdRight}>{r.virtual_received?.toFixed(2) || '0.00'}</td>
-                <td style={tdRight}>{r.released_to_icici?.toFixed(2) || '0.00'}</td>
+                <td style={tdRight}>{(r.amazon_disbursed || 0).toFixed(2)}</td>
+                <td style={tdRight}>{(r.virtual_received || 0).toFixed(2)}</td>
+                <td style={tdRight}>{(r.released_to_icici || 0).toFixed(2)}</td>
+                <td style={tdRight}>{(r.released_to_indifi || 0).toFixed(2)}</td>
               </tr>
             ))}
           </tbody>
@@ -117,7 +126,8 @@ export default function Settlements() {
               <td style={td}>TOTAL</td>
               <td style={tdRight}>{totals.amazon.toFixed(2)}</td>
               <td style={tdRight}>{totals.in.toFixed(2)}</td>
-              <td style={tdRight}>{totals.out.toFixed(2)}</td>
+              <td style={tdRight}>{totals.outIcici.toFixed(2)}</td>
+              <td style={tdRight}>{totals.outIndifi.toFixed(2)}</td>
             </tr>
           </tfoot>
         </table>
