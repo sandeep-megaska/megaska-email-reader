@@ -70,7 +70,7 @@ export default function Settlements() {
     <div style={{ fontFamily: 'system-ui, Arial', padding: 24, maxWidth: 1100, margin: '0 auto' }}>
       <h1>Amazon ↔ Indifi ↔ ICICI – Settlements</h1>
       <p style={{ color: '#666' }}>
-        Pick a date range. We’ll read Gmail, match the four email types, and summarize per day.
+        Pick a date range to see the daily transactions details between amazon, virtual account, BGONBUY and Indifi Accounts.
       </p>
 
       <div style={{ display:'flex', gap:12, alignItems:'center', margin:'12px 0 18px' }}>
@@ -103,7 +103,7 @@ export default function Settlements() {
               <th style={th}>Date</th>
               <th style={th}>Amazon Disbursed (INR)</th>
               <th style={th}>Received in Virtual A/c (INR)</th>
-              <th style={th}>Released to ICICI (INR)</th>
+              <th style={th}>Released to BIGONBUY (INR)</th>
               <th style={th}>Released to Indifi (INR)</th>
             </tr>
           </thead>
