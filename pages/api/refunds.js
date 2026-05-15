@@ -36,40 +36,109 @@ function extractOrderId(text) {
   return m ? m[1] : '';
 }
 
-function cleanLines(text) {
+function stripHtml(text) {
   return String(text || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<\/td>/gi, '\n')
+    .replace(/<\/th>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"');
+}
+
+function cleanLines(text) {
+  return stripHtml(text)
     .replace(/\r/g, '')
     .split('\n')
-    .map(x => x.trim())
+    .map(x => x.replace(/\s+/g, ' ').trim())
     .filter(Boolean);
+}
+
+function isHeaderLine(line) {
+  return /^(ASIN|SKU|Order Quantity|Return Quantity|Order Item|Refund Reason)$/i.test(line);
+}
+
+function isLikelySku(line) {
+  return /^[A-Z0-9][A-Z0-9._/-]*[A-Z0-9]$/i.test(line) && /[-_]/.test(line) && !ASIN.test(line);
+}
+
+function isLikelyReason(line) {
+  return /reject|damag|return|customer|undeliver|wrong|defect|missing|quality|late|refus|cancel/i.test(line);
+}
+
+function parseItemBlock(lines) {
+  const data = {
+    asin: '',
+    sku: '',
+    order_quantity: 0,
+    return_quantity: 0,
+    item: '',
+    refund_reason: ''
+  };
+
+  const asinIndex = lines.findIndex(line => ASIN.test(line));
+  if (asinIndex < 0) return data;
+
+  data.asin = lines[asinIndex];
+
+  const values = [];
+  for (let i = asinIndex + 1; i < lines.length && values.length < 12; i++) {
+    const line = lines[i];
+    if (/^Your seller account will be debited accordingly/i.test(line)) break;
+    if (/^You can view your account/i.test(line)) break;
+    if (/^Thank you for selling on Amazon/i.test(line)) break;
+    if (isHeaderLine(line)) continue;
+    values.push(line);
+  }
+
+  const skuIndex = values.findIndex(isLikelySku);
+  if (skuIndex >= 0) data.sku = values[skuIndex];
+
+  const qtyIndexes = [];
+  values.forEach((line, idx) => {
+    if (/^\d+$/.test(line)) qtyIndexes.push(idx);
+  });
+  if (qtyIndexes.length > 0) data.order_quantity = Number(values[qtyIndexes[0]]) || 0;
+  if (qtyIndexes.length > 1) data.return_quantity = Number(values[qtyIndexes[1]]) || 0;
+
+  const reasonIndex = values.findIndex(isLikelyReason);
+  if (reasonIndex >= 0) data.refund_reason = values[reasonIndex];
+
+  const excluded = new Set([skuIndex, reasonIndex, ...qtyIndexes]);
+  const itemCandidates = values.filter((line, idx) => {
+    if (excluded.has(idx)) return false;
+    if (ASIN.test(line)) return false;
+    if (isHeaderLine(line)) return false;
+    return line.length > 10;
+  });
+
+  if (itemCandidates.length) {
+    data.item = itemCandidates.sort((a, b) => b.length - a.length)[0];
+  }
+
+  return data;
 }
 
 function parseRefundEmail(subject, body) {
   const combined = `${subject}\n${body}`;
   const lines = cleanLines(body);
 
-  const customerMatch = body.match(/refund\s+in\s+the\s+amount\s+of\s+INR\s*[0-9][0-9,]*(?:\.\d{1,2})?\s+to\s+(.+?)\s+for\s+the\s+following\s+items/i);
-  const fulfilmentMatch = body.match(/Fulfilment:\s*(.+)/i);
-
-  const asinIndex = lines.findIndex(line => ASIN.test(line));
-  const asin = asinIndex >= 0 ? lines[asinIndex] : '';
-  const sku = asinIndex >= 0 ? lines[asinIndex + 1] || '' : '';
-  const orderQuantity = asinIndex >= 0 ? Number(lines[asinIndex + 2]) || 0 : 0;
-  const returnQuantity = asinIndex >= 0 ? Number(lines[asinIndex + 3]) || 0 : 0;
-  const item = asinIndex >= 0 ? lines[asinIndex + 4] || '' : '';
-  const refundReason = asinIndex >= 0 ? lines[asinIndex + 5] || '' : '';
+  const customerMatch = stripHtml(body).match(/refund\s+in\s+the\s+amount\s+of\s+INR\s*[0-9][0-9,]*(?:\.\d{1,2})?\s+to\s+(.+?)\s+for\s+the\s+following\s+items/i);
+  const fulfilmentMatch = stripHtml(body).match(/Fulfilment:\s*(.+)/i);
+  const itemData = parseItemBlock(lines);
 
   return {
     order_id: extractOrderId(combined),
     amount: extractAmount(subject) || extractAmount(body),
     customer: customerMatch ? customerMatch[1].trim() : '',
     fulfilment: fulfilmentMatch ? fulfilmentMatch[1].trim() : '',
-    asin,
-    sku,
-    order_quantity: orderQuantity,
-    return_quantity: returnQuantity,
-    item,
-    refund_reason: refundReason
+    ...itemData
   };
 }
 
