@@ -72,8 +72,8 @@ function isLikelyReason(line) {
   return /reject|damag|return|customer|undeliver|wrong|defect|missing|quality|late|refus|cancel/i.test(line);
 }
 
-function parseItemBlock(lines) {
-  const data = {
+function emptyItem() {
+  return {
     asin: '',
     sku: '',
     order_quantity: 0,
@@ -81,21 +81,11 @@ function parseItemBlock(lines) {
     item: '',
     refund_reason: ''
   };
+}
 
-  const asinIndex = lines.findIndex(line => ASIN.test(line));
-  if (asinIndex < 0) return data;
-
-  data.asin = lines[asinIndex];
-
-  const values = [];
-  for (let i = asinIndex + 1; i < lines.length && values.length < 12; i++) {
-    const line = lines[i];
-    if (/^Your seller account will be debited accordingly/i.test(line)) break;
-    if (/^You can view your account/i.test(line)) break;
-    if (/^Thank you for selling on Amazon/i.test(line)) break;
-    if (isHeaderLine(line)) continue;
-    values.push(line);
-  }
+function parseOneItem(values, asin) {
+  const data = emptyItem();
+  data.asin = asin;
 
   const skuIndex = values.findIndex(isLikelySku);
   if (skuIndex >= 0) data.sku = values[skuIndex];
@@ -125,20 +115,181 @@ function parseItemBlock(lines) {
   return data;
 }
 
-function parseRefundEmail(subject, body) {
+function parseItemBlocks(lines) {
+  const items = [];
+  const asinIndexes = [];
+
+  lines.forEach((line, idx) => {
+    if (ASIN.test(line)) asinIndexes.push(idx);
+  });
+
+  for (let a = 0; a < asinIndexes.length; a++) {
+    const start = asinIndexes[a];
+    const nextAsin = asinIndexes[a + 1] || lines.length;
+    const values = [];
+
+    for (let i = start + 1; i < nextAsin && values.length < 20; i++) {
+      const line = lines[i];
+      if (/^Your seller account will be debited accordingly/i.test(line)) break;
+      if (/^You can view your account/i.test(line)) break;
+      if (/^Thank you for selling on Amazon/i.test(line)) break;
+      if (isHeaderLine(line)) continue;
+      values.push(line);
+    }
+
+    items.push(parseOneItem(values, lines[start]));
+  }
+
+  return items.length ? items : [emptyItem()];
+}
+
+function shouldUseOpenAiFallback(items) {
+  return items.some(item => !item.asin || !item.sku || !item.item || !item.refund_reason || !item.return_quantity);
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    const m = String(text || '').match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    try { return JSON.parse(m[0]); } catch (e) { return null; }
+  }
+}
+
+async function openAiFallbackParse({ subject, body }) {
+  if (!process.env.OPENAI_API_KEY) return null;
+
+  const prompt = `Extract Amazon seller refund initiated email details as JSON only.
+Return this exact shape:
+{
+  "order_id": "",
+  "amount": 0,
+  "customer": "",
+  "fulfilment": "",
+  "items": [
+    {
+      "asin": "",
+      "sku": "",
+      "order_quantity": 0,
+      "return_quantity": 0,
+      "item": "",
+      "refund_reason": ""
+    }
+  ]
+}
+
+Rules:
+- Do not invent missing values.
+- Keep amounts numeric.
+- Include every refunded item if multiple items are present.
+- Output valid JSON only.
+
+Subject:\n${subject}\n\nEmail body:\n${stripHtml(body).slice(0, 12000)}`;
+
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: 'You extract structured data from Amazon seller refund emails. Return JSON only.' },
+        { role: 'user', content: prompt }
+      ]
+    })
+  });
+
+  if (!response.ok) return null;
+  const json = await response.json();
+  return safeJsonParse(json.choices?.[0]?.message?.content);
+}
+
+function normalizeOpenAiResult(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const items = Array.isArray(parsed.items) && parsed.items.length ? parsed.items : [emptyItem()];
+  return {
+    order_id: parsed.order_id || '',
+    amount: Number(parsed.amount) || 0,
+    customer: parsed.customer || '',
+    fulfilment: parsed.fulfilment || '',
+    items: items.map(item => ({
+      ...emptyItem(),
+      asin: item.asin || '',
+      sku: item.sku || '',
+      order_quantity: Number(item.order_quantity) || 0,
+      return_quantity: Number(item.return_quantity) || 0,
+      item: item.item || '',
+      refund_reason: item.refund_reason || ''
+    }))
+  };
+}
+
+async function parseRefundEmail(subject, body) {
   const combined = `${subject}\n${body}`;
+  const plainBody = stripHtml(body);
   const lines = cleanLines(body);
 
-  const customerMatch = stripHtml(body).match(/refund\s+in\s+the\s+amount\s+of\s+INR\s*[0-9][0-9,]*(?:\.\d{1,2})?\s+to\s+(.+?)\s+for\s+the\s+following\s+items/i);
-  const fulfilmentMatch = stripHtml(body).match(/Fulfilment:\s*(.+)/i);
-  const itemData = parseItemBlock(lines);
+  const customerMatch = plainBody.match(/refund\s+in\s+the\s+amount\s+of\s+INR\s*[0-9][0-9,]*(?:\.\d{1,2})?\s+to\s+(.+?)\s+for\s+the\s+following\s+items/i);
+  const fulfilmentMatch = plainBody.match(/Fulfilment:\s*(.+)/i);
 
-  return {
+  let parsed = {
     order_id: extractOrderId(combined),
     amount: extractAmount(subject) || extractAmount(body),
     customer: customerMatch ? customerMatch[1].trim() : '',
     fulfilment: fulfilmentMatch ? fulfilmentMatch[1].trim() : '',
-    ...itemData
+    items: parseItemBlocks(lines),
+    parsed_by: 'regex'
+  };
+
+  if (shouldUseOpenAiFallback(parsed.items)) {
+    const aiParsed = normalizeOpenAiResult(await openAiFallbackParse({ subject, body }));
+    if (aiParsed) {
+      parsed = {
+        order_id: aiParsed.order_id || parsed.order_id,
+        amount: aiParsed.amount || parsed.amount,
+        customer: aiParsed.customer || parsed.customer,
+        fulfilment: aiParsed.fulfilment || parsed.fulfilment,
+        items: aiParsed.items?.length ? aiParsed.items : parsed.items,
+        parsed_by: 'openai_fallback'
+      };
+    }
+  }
+
+  return parsed;
+}
+
+function buildAnalytics(rows, totalRefundAmount) {
+  const bySku = new Map();
+  const byReason = new Map();
+
+  for (const row of rows) {
+    const sku = row.sku || 'Unknown SKU';
+    const reason = row.refund_reason || 'Unknown reason';
+    const returnQty = Number(row.return_quantity) || 0;
+
+    if (!bySku.has(sku)) bySku.set(sku, { sku, refund_items: 0, return_quantity: 0 });
+    bySku.get(sku).refund_items += 1;
+    bySku.get(sku).return_quantity += returnQty;
+
+    if (!byReason.has(reason)) byReason.set(reason, { reason, refund_items: 0, return_quantity: 0 });
+    byReason.get(reason).refund_items += 1;
+    byReason.get(reason).return_quantity += returnQty;
+  }
+
+  const sortMetric = x => (x.return_quantity || 0) * 100000 + (x.refund_items || 0);
+
+  return {
+    total_refund_amount: totalRefundAmount,
+    total_refund_emails: new Set(rows.map(r => r.id)).size,
+    total_refund_items: rows.length,
+    total_return_quantity: rows.reduce((sum, row) => sum + (Number(row.return_quantity) || 0), 0),
+    top_skus: Array.from(bySku.values()).sort((a, b) => sortMetric(b) - sortMetric(a)).slice(0, 10),
+    top_reasons: Array.from(byReason.values()).sort((a, b) => sortMetric(b) - sortMetric(a)).slice(0, 10)
   };
 }
 
@@ -157,34 +308,52 @@ export default async function handler(req, res) {
 
     const messages = await listMessages(gmail, qRefunds, 500);
     const rows = [];
+    let totalRefundAmount = 0;
+    let openAiFallbackCount = 0;
 
     for (const { id } of messages) {
       const msg = await loadMessage(gmail, id);
       const subject = headerValue(msg.payload?.headers, 'Subject') || '';
       const from = headerValue(msg.payload?.headers, 'From') || '';
       const internalDate = Number(msg.internalDate);
+      const date = ymd(internalDate, tz);
       const body = extractBody(msg.payload);
-      const parsed = parseRefundEmail(subject, body);
+      const parsed = await parseRefundEmail(subject, body);
+      const items = parsed.items?.length ? parsed.items : [emptyItem()];
 
-      rows.push({
-        id,
-        date: ymd(internalDate, tz),
-        subject,
-        from,
-        ...parsed
+      totalRefundAmount += parsed.amount || 0;
+      if (parsed.parsed_by === 'openai_fallback') openAiFallbackCount += 1;
+
+      items.forEach((item, idx) => {
+        rows.push({
+          id,
+          row_key: `${id}-${idx}`,
+          item_index: idx + 1,
+          item_count: items.length,
+          date,
+          subject,
+          from,
+          order_id: parsed.order_id,
+          amount: parsed.amount,
+          customer: parsed.customer,
+          fulfilment: parsed.fulfilment,
+          parsed_by: parsed.parsed_by,
+          ...item
+        });
       });
     }
 
-    rows.sort((a, b) => a.date.localeCompare(b.date) || a.order_id.localeCompare(b.order_id));
+    rows.sort((a, b) => a.date.localeCompare(b.date) || a.order_id.localeCompare(b.order_id) || a.item_index - b.item_index);
 
     res.status(200).json({
       tz,
       start,
       end,
       count: rows.length,
-      total_refund_amount: rows.reduce((sum, row) => sum + (row.amount || 0), 0),
+      total_refund_amount: totalRefundAmount,
+      analytics: buildAnalytics(rows, totalRefundAmount),
       rows,
-      debug: { messages: messages.length, query: qRefunds }
+      debug: { messages: messages.length, query: qRefunds, openai_fallback_count: openAiFallbackCount }
     });
   } catch (e) {
     console.error(e);
