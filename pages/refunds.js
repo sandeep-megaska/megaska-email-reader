@@ -1,20 +1,30 @@
 import { useEffect, useMemo, useState } from 'react';
 
 const exportHeaders = [
-  ['date', 'Date'],
-  ['order_id', 'Order ID'],
-  ['amount', 'Amount'],
-  ['customer', 'Customer'],
-  ['fulfilment', 'Fulfilment'],
-  ['asin', 'ASIN'],
+  ['marketplace', 'bbbbbbbbb'],
+  ['order_id', 'Oder id'],
+  ['forward_courier', 'Forward Co'],
+  ['refund_initiated_date', 'Refund initia'],
+  ['return_courier', 'Return'],
+  ['return_date', 'Return date'],
+  ['refund_reason', 'Refund reoason'],
   ['sku', 'SKU'],
-  ['order_quantity', 'Order Quantity'],
-  ['return_quantity', 'Return Quantity'],
-  ['item', 'Item'],
-  ['refund_reason', 'Refund Reason'],
-  ['subject', 'Email Subject'],
-  ['from', 'From']
+  ['qty', 'Qty']
 ];
+
+function reportRows(rows) {
+  return rows.map(row => ({
+    marketplace: 'Flex',
+    order_id: row.order_id || '',
+    forward_courier: row.forward_courier || '',
+    refund_initiated_date: row.date || '',
+    return_courier: row.return_courier || '',
+    return_date: row.return_date || '',
+    refund_reason: row.refund_reason || '',
+    sku: row.sku || '',
+    qty: row.return_quantity || row.order_quantity || '',
+  }));
+}
 
 function csvEscape(value) {
   const s = value === null || value === undefined ? '' : String(value);
@@ -22,8 +32,9 @@ function csvEscape(value) {
 }
 
 function toCSV(rows) {
+  const formattedRows = reportRows(rows);
   const lines = [exportHeaders.map(([, label]) => csvEscape(label)).join(',')];
-  for (const row of rows) {
+  for (const row of formattedRows) {
     lines.push(exportHeaders.map(([key]) => csvEscape(row[key])).join(','));
   }
   return lines.join('\n');
@@ -38,8 +49,9 @@ function htmlEscape(value) {
 }
 
 function toExcelHtml(rows) {
+  const formattedRows = reportRows(rows);
   const headerCells = exportHeaders.map(([, label]) => `<th>${htmlEscape(label)}</th>`).join('');
-  const bodyRows = rows.map(row => (
+  const bodyRows = formattedRows.map(row => (
     `<tr>${exportHeaders.map(([key]) => `<td>${htmlEscape(row[key])}</td>`).join('')}</tr>`
   )).join('');
 
@@ -112,11 +124,13 @@ export default function Refunds() {
 
   useEffect(()=>{ load(); }, []);
 
+  const displayRows = reportRows(rows);
+
   return (
     <div style={{ fontFamily: 'system-ui, Arial', padding: 24, maxWidth: 1200, margin: '0 auto' }}>
       <h1>Amazon Refunds</h1>
       <p style={{ color: '#666' }}>
-        Track Amazon refund initiated emails by order, amount, SKU, item, customer, and reason.
+        Track Amazon refund initiated emails in the operations sheet format.
       </p>
 
       <div style={{ display:'flex', gap:12, alignItems:'center', flexWrap:'wrap', margin:'12px 0 18px' }}>
@@ -148,45 +162,21 @@ export default function Refunds() {
         <table style={{ borderCollapse: 'collapse', width: '100%' }}>
           <thead>
             <tr style={{ background:'#fafafa' }}>
-              <th style={th}>Date</th>
-              <th style={th}>Order</th>
-              <th style={th}>Amount</th>
-              <th style={th}>Customer</th>
-              <th style={th}>ASIN</th>
-              <th style={th}>SKU</th>
-              <th style={th}>Qty</th>
-              <th style={th}>Return Qty</th>
-              <th style={th}>Item</th>
-              <th style={th}>Reason</th>
+              {exportHeaders.map(([, label]) => <th key={label} style={th}>{label}</th>)}
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && !loading && (
-              <tr><td colSpan={10} style={{ padding:14, textAlign:'center', color:'#777' }}>No data</td></tr>
+            {displayRows.length === 0 && !loading && (
+              <tr><td colSpan={exportHeaders.length} style={{ padding:14, textAlign:'center', color:'#777' }}>No data</td></tr>
             )}
-            {rows.map(r => (
-              <tr key={r.id}>
-                <td style={td}>{r.date}</td>
-                <td style={td}>{r.order_id}</td>
-                <td style={tdRight}>{(Number(r.amount) || 0).toFixed(2)}</td>
-                <td style={td}>{r.customer}</td>
-                <td style={td}>{r.asin}</td>
-                <td style={td}>{r.sku}</td>
-                <td style={tdRight}>{r.order_quantity}</td>
-                <td style={tdRight}>{r.return_quantity}</td>
-                <td style={td}>{r.item}</td>
-                <td style={td}>{r.refund_reason}</td>
+            {displayRows.map((r, idx) => (
+              <tr key={rows[idx]?.row_key || rows[idx]?.id || idx}>
+                {exportHeaders.map(([key]) => (
+                  <td key={key} style={key === 'qty' ? tdRight : td}>{r[key]}</td>
+                ))}
               </tr>
             ))}
           </tbody>
-          <tfoot>
-            <tr style={{ background:'#f6faff', fontWeight: 600 }}>
-              <td style={td}>TOTAL</td>
-              <td style={td}></td>
-              <td style={tdRight}>{totalAmount.toFixed(2)}</td>
-              <td style={td} colSpan={7}></td>
-            </tr>
-          </tfoot>
         </table>
       </div>
     </div>
