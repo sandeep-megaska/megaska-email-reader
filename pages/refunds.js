@@ -16,10 +16,10 @@ function reportRows(rows) {
   return rows.map(row => ({
     marketplace: 'Flex',
     order_id: row.order_id || '',
-    forward_courier: row.forward_courier || '',
-    refund_initiated_date: row.date || '',
-    return_courier: row.return_courier || '',
-    return_date: row.return_date || '',
+    forward_courier: '',
+    refund_initiated_date: row.refund_initiated_timestamp || '',
+    return_courier: '',
+    return_date: '',
     refund_reason: row.refund_reason || '',
     sku: row.sku || '',
     qty: row.return_quantity || row.order_quantity || '',
@@ -50,16 +50,16 @@ function htmlEscape(value) {
 
 function toExcelHtml(rows) {
   const formattedRows = reportRows(rows);
-  const headerCells = exportHeaders.map(([, label]) => `<th>${htmlEscape(label)}</th>`).join('');
+  const headerCells = exportHeaders.map(([, label]) => `<th style="border:1px solid #ccc;">${htmlEscape(label)}</th>`).join('');
   const bodyRows = formattedRows.map(row => (
-    `<tr>${exportHeaders.map(([key]) => `<td>${htmlEscape(row[key])}</td>`).join('')}</tr>`
+    `<tr>${exportHeaders.map(([key]) => `<td style="border:1px solid #ccc;">${htmlEscape(row[key])}</td>`).join('')}</tr>`
   )).join('');
 
   return `<!doctype html>
 <html>
 <head><meta charset="utf-8"></head>
 <body>
-<table border="1">
+<table style="border-collapse:collapse;">
 <thead><tr>${headerCells}</tr></thead>
 <tbody>${bodyRows}</tbody>
 </table>
@@ -129,9 +129,6 @@ export default function Refunds() {
   return (
     <div style={{ fontFamily: 'system-ui, Arial', padding: 24, maxWidth: 1200, margin: '0 auto' }}>
       <h1>Amazon Refunds</h1>
-      <p style={{ color: '#666' }}>
-        Track Amazon refund initiated emails in the operations sheet format.
-      </p>
 
       <div style={{ display:'flex', gap:12, alignItems:'center', flexWrap:'wrap', margin:'12px 0 18px' }}>
         <label>Start:&nbsp;
@@ -151,38 +148,29 @@ export default function Refunds() {
         </button>
       </div>
 
-      <div style={{ marginBottom: 10, fontSize: 14, color: '#444' }}>
-        <b>Rows:</b> {rows.length} &nbsp;|&nbsp; <b>Total refund amount:</b> INR {totalAmount.toFixed(2)}
+      <div style={{ marginBottom: 10 }}>
+        Rows: {rows.length} | Total refund amount: INR {totalAmount.toFixed(2)}
       </div>
 
-      {error && <div style={{ color: 'crimson', marginBottom: 12 }}>Error: {error}</div>}
+      {error && <div style={{ color: 'red' }}>Error: {error}</div>}
       {loading && <div>Loading...</div>}
 
-      <div style={{ overflowX: 'auto', border:'1px solid #eee', borderRadius:8 }}>
-        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
-          <thead>
-            <tr style={{ background:'#fafafa' }}>
-              {exportHeaders.map(([, label]) => <th key={label} style={th}>{label}</th>)}
+      <table style={{ borderCollapse:'collapse', width:'100%' }}>
+        <thead>
+          <tr>
+            {exportHeaders.map(([, label]) => <th key={label} style={{ border:'1px solid #ccc', padding:8 }}>{label}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {displayRows.map((r, idx) => (
+            <tr key={rows[idx]?.row_key || idx}>
+              {exportHeaders.map(([key]) => (
+                <td key={key} style={{ border:'1px solid #ccc', padding:8 }}>{r[key]}</td>
+              ))}
             </tr>
-          </thead>
-          <tbody>
-            {displayRows.length === 0 && !loading && (
-              <tr><td colSpan={exportHeaders.length} style={{ padding:14, textAlign:'center', color:'#777' }}>No data</td></tr>
-            )}
-            {displayRows.map((r, idx) => (
-              <tr key={rows[idx]?.row_key || rows[idx]?.id || idx}>
-                {exportHeaders.map(([key]) => (
-                  <td key={key} style={key === 'qty' ? tdRight : td}>{r[key]}</td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
-
-const th = { textAlign:'left', padding:'10px 12px', borderBottom:'1px solid #eee', whiteSpace:'nowrap' };
-const td = { padding:'10px 12px', borderBottom:'1px solid #f2f2f2', verticalAlign:'top' };
-const tdRight = { ...td, textAlign:'right', fontVariantNumeric:'tabular-nums' };
