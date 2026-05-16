@@ -3,27 +3,48 @@ import { gmailClient, listMessages, loadMessage, extractBody, headerValue, getTZ
 const AMOUNT_INR = /(?:INR\s*([0-9][0-9,]*(?:\.\d{1,2})?)|([0-9][0-9,]*(?:\.\d{1,2})?)\s*INR)/i;
 const ORDER_ID = /order\s+([0-9]{3}-[0-9]{7}-[0-9]{7})/i;
 const ASIN = /^B[A-Z0-9]{9}$/i;
+const REFUND_TZ = process.env.REFUND_TZ || 'Asia/Kolkata';
 
 const num = s => (s ? Number(String(s).replace(/,/g, '')) : 0);
 
-function ymd(date, tz) {
+function ymd(date, tz = REFUND_TZ) {
   const d = new Date(date);
   const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit' });
   return fmt.format(d);
 }
 
-function addOneDay(dateString) {
+function timestampInTZ(date, tz = REFUND_TZ) {
+  const d = new Date(date);
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit',
+    hour12: false
+  }).formatToParts(d).reduce((acc, part) => {
+    acc[part.type] = part.value;
+    return acc;
+  }, {});
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function addDays(dateString, days) {
   const d = new Date(`${dateString}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + 1);
+  d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
 }
 
 function gmailDateQuery(start, end) {
   return {
-    startQ: start.replaceAll('-', '/'),
-    // Gmail before: is exclusive, so add one day to make the UI end date inclusive.
-    endQ: addOneDay(end).replaceAll('-', '/')
+    // Gmail after/before uses date-only boundaries that can behave differently around timezone edges.
+    // Search one extra day on both sides, then filter precisely by India date after loading messages.
+    startQ: addDays(start, -1).replaceAll('-', '/'),
+    endQ: addDays(end, 2).replaceAll('-', '/')
   };
+}
+
+function isWithinSelectedIndiaDates(internalDate, start, end) {
+  const dateKey = ymd(internalDate, REFUND_TZ);
+  return dateKey >= start && dateKey <= end;
 }
 
 function extractAmount(text) {
@@ -69,7 +90,7 @@ function isLikelySku(line) {
 }
 
 function isLikelyReason(line) {
-  return /reject|damag|return|customer|undeliver|wrong|defect|missing|quality|late|refus|cancel/i.test(line);
+  return /reject|damag|return|customer|undeliver|wrong|defect|missing|quality|late|refus|cancel|product|described|different|not as described|unsellable|sellable|no longer needed|performance|style|size|fit|address/i.test(line);
 }
 
 function emptyItem() {
@@ -110,6 +131,14 @@ function parseOneItem(values, asin) {
 
   if (itemCandidates.length) {
     data.item = itemCandidates.sort((a, b) => b.length - a.length)[0];
+  }
+
+  // In the common Amazon table order, reason is the last meaningful value after item.
+  // This catches reasons that do not contain our keywords.
+  if (!data.refund_reason && itemCandidates.length) {
+    const itemIdx = values.indexOf(data.item);
+    const laterValues = values.slice(itemIdx + 1).filter(line => !isHeaderLine(line) && !/^\d+$/.test(line));
+    if (laterValues.length) data.refund_reason = laterValues[laterValues.length - 1];
   }
 
   return data;
@@ -295,7 +324,7 @@ function buildAnalytics(rows, totalRefundAmount) {
 
 export default async function handler(req, res) {
   try {
-    const tz = getTZ();
+    const tz = REFUND_TZ;
     const { start, end } = req.query;
 
     if (!start || !end) {
@@ -306,17 +335,24 @@ export default async function handler(req, res) {
     const { startQ, endQ } = gmailDateQuery(start, end);
     const qRefunds = `after:${startQ} before:${endQ} subject:"refund initiated" subject:order`;
 
-    const messages = await listMessages(gmail, qRefunds, 500);
+    const messages = await listMessages(gmail, qRefunds, 1000);
     const rows = [];
     let totalRefundAmount = 0;
     let openAiFallbackCount = 0;
+    let skippedOutsideIndiaDateRange = 0;
 
     for (const { id } of messages) {
       const msg = await loadMessage(gmail, id);
+      const internalDate = Number(msg.internalDate);
+      if (!isWithinSelectedIndiaDates(internalDate, start, end)) {
+        skippedOutsideIndiaDateRange += 1;
+        continue;
+      }
+
       const subject = headerValue(msg.payload?.headers, 'Subject') || '';
       const from = headerValue(msg.payload?.headers, 'From') || '';
-      const internalDate = Number(msg.internalDate);
       const date = ymd(internalDate, tz);
+      const refund_initiated_timestamp = timestampInTZ(internalDate, tz);
       const body = extractBody(msg.payload);
       const parsed = await parseRefundEmail(subject, body);
       const items = parsed.items?.length ? parsed.items : [emptyItem()];
@@ -331,6 +367,7 @@ export default async function handler(req, res) {
           item_index: idx + 1,
           item_count: items.length,
           date,
+          refund_initiated_timestamp,
           subject,
           from,
           order_id: parsed.order_id,
@@ -343,7 +380,7 @@ export default async function handler(req, res) {
       });
     }
 
-    rows.sort((a, b) => a.date.localeCompare(b.date) || a.order_id.localeCompare(b.order_id) || a.item_index - b.item_index);
+    rows.sort((a, b) => a.refund_initiated_timestamp.localeCompare(b.refund_initiated_timestamp) || a.order_id.localeCompare(b.order_id) || a.item_index - b.item_index);
 
     res.status(200).json({
       tz,
@@ -353,7 +390,7 @@ export default async function handler(req, res) {
       total_refund_amount: totalRefundAmount,
       analytics: buildAnalytics(rows, totalRefundAmount),
       rows,
-      debug: { messages: messages.length, query: qRefunds, openai_fallback_count: openAiFallbackCount }
+      debug: { messages: messages.length, query: qRefunds, openai_fallback_count: openAiFallbackCount, skipped_outside_india_date_range: skippedOutsideIndiaDateRange }
     });
   } catch (e) {
     console.error(e);
