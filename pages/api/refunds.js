@@ -4,6 +4,20 @@ const AMOUNT_INR = /(?:INR\s*([0-9][0-9,]*(?:\.\d{1,2})?)|([0-9][0-9,]*(?:\.\d{1
 const ORDER_ID = /order\s+([0-9]{3}-[0-9]{7}-[0-9]{7})/i;
 const ASIN = /^B[A-Z0-9]{9}$/i;
 const REFUND_TZ = process.env.REFUND_TZ || 'Asia/Kolkata';
+const KNOWN_REFUND_REASONS = [
+  'Customer Reject',
+  'Buyer return',
+  'Product not as described',
+  'Undeliverable shipping address',
+  'General adjustment',
+  'Order not received',
+  'Different item',
+  'Damaged During Transit',
+  'not received',
+  'Unable To Deliver',
+  'Billing error',
+  'Delivered Late by Carrier'
+];
 
 const num = s => (s ? Number(String(s).replace(/,/g, '')) : 0);
 
@@ -35,8 +49,6 @@ function addDays(dateString, days) {
 
 function gmailDateQuery(start, end) {
   return {
-    // Gmail after/before uses date-only boundaries that can behave differently around timezone edges.
-    // Search one extra day on both sides, then filter precisely by India date after loading messages.
     startQ: addDays(start, -1).replaceAll('-', '/'),
     endQ: addDays(end, 2).replaceAll('-', '/')
   };
@@ -81,16 +93,40 @@ function cleanLines(text) {
     .filter(Boolean);
 }
 
+function normalizeReasonText(line) {
+  return String(line || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .replace(/^unble to deliver$/, 'unable to deliver')
+    .replace(/^unable to deliver$/, 'unable to deliver');
+}
+
+function canonicalRefundReason(line) {
+  const normalized = normalizeReasonText(line);
+  if (!normalized) return '';
+
+  const exact = KNOWN_REFUND_REASONS.find(reason => normalizeReasonText(reason) === normalized);
+  if (exact) return exact;
+
+  // Common typo seen in ops data.
+  if (normalized === 'unble to deliver') return 'Unable To Deliver';
+
+  // Allow contained matches only for short reason-like lines, never long product names.
+  if (line.length <= 60) {
+    const contained = KNOWN_REFUND_REASONS.find(reason => normalized.includes(normalizeReasonText(reason)));
+    if (contained) return contained;
+  }
+
+  return '';
+}
+
 function isHeaderLine(line) {
   return /^(ASIN|SKU|Order Quantity|Return Quantity|Order Item|Refund Reason)$/i.test(line);
 }
 
 function isLikelySku(line) {
   return /^[A-Z0-9][A-Z0-9._/-]*[A-Z0-9]$/i.test(line) && /[-_]/.test(line) && !ASIN.test(line);
-}
-
-function isLikelyReason(line) {
-  return /reject|damag|return|customer|undeliver|wrong|defect|missing|quality|late|refus|cancel|product|described|different|not as described|unsellable|sellable|no longer needed|performance|style|size|fit|address/i.test(line);
 }
 
 function emptyItem() {
@@ -118,27 +154,27 @@ function parseOneItem(values, asin) {
   if (qtyIndexes.length > 0) data.order_quantity = Number(values[qtyIndexes[0]]) || 0;
   if (qtyIndexes.length > 1) data.return_quantity = Number(values[qtyIndexes[1]]) || 0;
 
-  const reasonIndex = values.findIndex(isLikelyReason);
-  if (reasonIndex >= 0) data.refund_reason = values[reasonIndex];
+  let reasonIndex = -1;
+  for (let i = values.length - 1; i >= 0; i--) {
+    const reason = canonicalRefundReason(values[i]);
+    if (reason) {
+      data.refund_reason = reason;
+      reasonIndex = i;
+      break;
+    }
+  }
 
   const excluded = new Set([skuIndex, reasonIndex, ...qtyIndexes]);
   const itemCandidates = values.filter((line, idx) => {
     if (excluded.has(idx)) return false;
     if (ASIN.test(line)) return false;
     if (isHeaderLine(line)) return false;
+    if (canonicalRefundReason(line)) return false;
     return line.length > 10;
   });
 
   if (itemCandidates.length) {
     data.item = itemCandidates.sort((a, b) => b.length - a.length)[0];
-  }
-
-  // In the common Amazon table order, reason is the last meaningful value after item.
-  // This catches reasons that do not contain our keywords.
-  if (!data.refund_reason && itemCandidates.length) {
-    const itemIdx = values.indexOf(data.item);
-    const laterValues = values.slice(itemIdx + 1).filter(line => !isHeaderLine(line) && !/^\d+$/.test(line));
-    if (laterValues.length) data.refund_reason = laterValues[laterValues.length - 1];
   }
 
   return data;
@@ -208,10 +244,14 @@ Return this exact shape:
   ]
 }
 
+Allowed refund_reason values only:
+${KNOWN_REFUND_REASONS.map(x => `- ${x}`).join('\n')}
+
 Rules:
 - Do not invent missing values.
 - Keep amounts numeric.
 - Include every refunded item if multiple items are present.
+- refund_reason must be one of the allowed values or blank.
 - Output valid JSON only.
 
 Subject:\n${subject}\n\nEmail body:\n${stripHtml(body).slice(0, 12000)}`;
@@ -253,7 +293,7 @@ function normalizeOpenAiResult(parsed) {
       order_quantity: Number(item.order_quantity) || 0,
       return_quantity: Number(item.return_quantity) || 0,
       item: item.item || '',
-      refund_reason: item.refund_reason || ''
+      refund_reason: canonicalRefundReason(item.refund_reason) || ''
     }))
   };
 }
