@@ -13,7 +13,7 @@ const card = {
 
 export default function Home() {
   return (
-    <div style={{ fontFamily: 'system-ui, Arial', padding: 24, maxWidth: 900, margin: '0 auto' }}>
+    <div style={{ fontFamily: 'system-ui, Arial', padding: 24, maxWidth: 1000, margin: '0 auto' }}>
       <h1 style={{ marginBottom: 8 }}>Megaska Email Reader</h1>
       <p style={{ color: '#666', marginBottom: 24 }}>
         Select a report to fetch and summarize Gmail communications.
@@ -30,7 +30,14 @@ export default function Home() {
         <Link href="/refunds" style={card}>
           <h2 style={{ marginTop: 0 }}>Refund Tracking</h2>
           <p style={{ color: '#555', marginBottom: 0 }}>
-            Track Amazon refund initiated emails by order, amount, SKU, item, customer, and reason.
+            Track Amazon refund initiated emails by order, SKU, quantity, and refund reason.
+          </p>
+        </Link>
+
+        <Link href="/reimbursements" style={card}>
+          <h2 style={{ marginTop: 0 }}>Amazon Reimbursements</h2>
+          <p style={{ color: '#555', marginBottom: 0 }}>
+            Track Amazon reimbursement postings by order ID, reimbursement date, and amount.
           </p>
         </Link>
       </div>
