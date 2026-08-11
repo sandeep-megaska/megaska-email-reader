@@ -1,4 +1,4 @@
-import { gmailClient, listMessages, loadMessage, extractBody, headerValue, getTZ } from './_gmail';
+import { gmailClient, listMessages, loadMessage, extractBody, headerValue } from './_gmail';
 
 const AMOUNT_INR = /(?:INR\s*([0-9][0-9,]*(?:\.\d{1,2})?)|([0-9][0-9,]*(?:\.\d{1,2})?)\s*INR)/i;
 const ORDER_ID = /order\s+([0-9]{3}-[0-9]{7}-[0-9]{7})/i;
@@ -98,8 +98,7 @@ function normalizeReasonText(line) {
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase()
-    .replace(/^unble to deliver$/, 'unable to deliver')
-    .replace(/^unable to deliver$/, 'unable to deliver');
+    .replace(/^unble to deliver$/, 'unable to deliver');
 }
 
 function canonicalRefundReason(line) {
@@ -109,11 +108,9 @@ function canonicalRefundReason(line) {
   const exact = KNOWN_REFUND_REASONS.find(reason => normalizeReasonText(reason) === normalized);
   if (exact) return exact;
 
-  // Common typo seen in ops data.
-  if (normalized === 'unble to deliver') return 'Unable To Deliver';
+  if (normalized === 'unable to deliver') return 'Unable To Deliver';
 
-  // Allow contained matches only for short reason-like lines, never long product names.
-  if (line.length <= 60) {
+  if (String(line).length <= 60) {
     const contained = KNOWN_REFUND_REASONS.find(reason => normalized.includes(normalizeReasonText(reason)));
     if (contained) return contained;
   }
@@ -225,7 +222,11 @@ function safeJsonParse(text) {
 async function openAiFallbackParse({ subject, body }) {
   if (!process.env.OPENAI_API_KEY) return null;
 
-  const prompt = `Extract Amazon seller refund initiated email details as JSON only.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+
+  try {
+    const prompt = `Extract Amazon seller refund initiated email details as JSON only.
 Return this exact shape:
 {
   "order_id": "",
@@ -256,26 +257,32 @@ Rules:
 
 Subject:\n${subject}\n\nEmail body:\n${stripHtml(body).slice(0, 12000)}`;
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      temperature: 0,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: 'You extract structured data from Amazon seller refund emails. Return JSON only.' },
-        { role: 'user', content: prompt }
-      ]
-    })
-  });
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        temperature: 0,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: 'You extract structured data from Amazon seller refund emails. Return JSON only.' },
+          { role: 'user', content: prompt }
+        ]
+      })
+    });
 
-  if (!response.ok) return null;
-  const json = await response.json();
-  return safeJsonParse(json.choices?.[0]?.message?.content);
+    if (!response.ok) return null;
+    const json = await response.json();
+    return safeJsonParse(json.choices?.[0]?.message?.content);
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function normalizeOpenAiResult(parsed) {
@@ -298,7 +305,7 @@ function normalizeOpenAiResult(parsed) {
   };
 }
 
-async function parseRefundEmail(subject, body) {
+async function parseRefundEmail(subject, body, enableAiFallback = false) {
   const combined = `${subject}\n${body}`;
   const plainBody = stripHtml(body);
   const lines = cleanLines(body);
@@ -315,7 +322,7 @@ async function parseRefundEmail(subject, body) {
     parsed_by: 'regex'
   };
 
-  if (shouldUseOpenAiFallback(parsed.items)) {
+  if (enableAiFallback && shouldUseOpenAiFallback(parsed.items)) {
     const aiParsed = normalizeOpenAiResult(await openAiFallbackParse({ subject, body }));
     if (aiParsed) {
       parsed = {
@@ -362,15 +369,56 @@ function buildAnalytics(rows, totalRefundAmount) {
   };
 }
 
+async function processMessage(gmail, id, start, end, enableAiFallback) {
+  const msg = await loadMessage(gmail, id);
+  const internalDate = Number(msg.internalDate);
+
+  if (!isWithinSelectedIndiaDates(internalDate, start, end)) {
+    return { skipped: true, rows: [], amount: 0, aiUsed: false };
+  }
+
+  const subject = headerValue(msg.payload?.headers, 'Subject') || '';
+  const from = headerValue(msg.payload?.headers, 'From') || '';
+  const date = ymd(internalDate, REFUND_TZ);
+  const refund_initiated_timestamp = timestampInTZ(internalDate, REFUND_TZ);
+  const body = extractBody(msg.payload);
+  const parsed = await parseRefundEmail(subject, body, enableAiFallback);
+  const items = parsed.items?.length ? parsed.items : [emptyItem()];
+
+  const rows = items.map((item, idx) => ({
+    id,
+    row_key: `${id}-${idx}`,
+    item_index: idx + 1,
+    item_count: items.length,
+    date,
+    refund_initiated_timestamp,
+    subject,
+    from,
+    order_id: parsed.order_id,
+    amount: parsed.amount,
+    customer: parsed.customer,
+    fulfilment: parsed.fulfilment,
+    parsed_by: parsed.parsed_by,
+    ...item
+  }));
+
+  return {
+    skipped: false,
+    rows,
+    amount: parsed.amount || 0,
+    aiUsed: parsed.parsed_by === 'openai_fallback'
+  };
+}
+
 export default async function handler(req, res) {
   try {
-    const tz = REFUND_TZ;
     const { start, end } = req.query;
 
     if (!start || !end) {
       return res.status(400).json({ error: 'Pass start and end as YYYY-MM-DD' });
     }
 
+    const enableAiFallback = req.query.ai === '1' || process.env.REFUND_AI_FALLBACK_ENABLED === 'true';
     const gmail = gmailClient();
     const { startQ, endQ } = gmailDateQuery(start, end);
     const qRefunds = `after:${startQ} before:${endQ} subject:"refund initiated" subject:order`;
@@ -381,56 +429,42 @@ export default async function handler(req, res) {
     let openAiFallbackCount = 0;
     let skippedOutsideIndiaDateRange = 0;
 
-    for (const { id } of messages) {
-      const msg = await loadMessage(gmail, id);
-      const internalDate = Number(msg.internalDate);
-      if (!isWithinSelectedIndiaDates(internalDate, start, end)) {
-        skippedOutsideIndiaDateRange += 1;
-        continue;
+    // Gmail message loads are I/O-bound. Small batches reduce runtime without flooding Gmail.
+    const batchSize = 8;
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize);
+      const results = await Promise.all(
+        batch.map(({ id }) => processMessage(gmail, id, start, end, enableAiFallback))
+      );
+
+      for (const result of results) {
+        if (result.skipped) {
+          skippedOutsideIndiaDateRange += 1;
+          continue;
+        }
+        rows.push(...result.rows);
+        totalRefundAmount += result.amount;
+        if (result.aiUsed) openAiFallbackCount += 1;
       }
-
-      const subject = headerValue(msg.payload?.headers, 'Subject') || '';
-      const from = headerValue(msg.payload?.headers, 'From') || '';
-      const date = ymd(internalDate, tz);
-      const refund_initiated_timestamp = timestampInTZ(internalDate, tz);
-      const body = extractBody(msg.payload);
-      const parsed = await parseRefundEmail(subject, body);
-      const items = parsed.items?.length ? parsed.items : [emptyItem()];
-
-      totalRefundAmount += parsed.amount || 0;
-      if (parsed.parsed_by === 'openai_fallback') openAiFallbackCount += 1;
-
-      items.forEach((item, idx) => {
-        rows.push({
-          id,
-          row_key: `${id}-${idx}`,
-          item_index: idx + 1,
-          item_count: items.length,
-          date,
-          refund_initiated_timestamp,
-          subject,
-          from,
-          order_id: parsed.order_id,
-          amount: parsed.amount,
-          customer: parsed.customer,
-          fulfilment: parsed.fulfilment,
-          parsed_by: parsed.parsed_by,
-          ...item
-        });
-      });
     }
 
     rows.sort((a, b) => a.refund_initiated_timestamp.localeCompare(b.refund_initiated_timestamp) || a.order_id.localeCompare(b.order_id) || a.item_index - b.item_index);
 
     res.status(200).json({
-      tz,
+      tz: REFUND_TZ,
       start,
       end,
       count: rows.length,
       total_refund_amount: totalRefundAmount,
       analytics: buildAnalytics(rows, totalRefundAmount),
       rows,
-      debug: { messages: messages.length, query: qRefunds, openai_fallback_count: openAiFallbackCount, skipped_outside_india_date_range: skippedOutsideIndiaDateRange }
+      debug: {
+        messages: messages.length,
+        query: qRefunds,
+        ai_fallback_enabled: enableAiFallback,
+        openai_fallback_count: openAiFallbackCount,
+        skipped_outside_india_date_range: skippedOutsideIndiaDateRange
+      }
     });
   } catch (e) {
     console.error(e);
