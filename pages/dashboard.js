@@ -4,16 +4,40 @@ function money(value) {
   return `INR ${(Number(value) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+async function fetchReport(url, label) {
+  try {
+    const res = await fetch(url);
+    let json = null;
+
+    try {
+      json = await res.json();
+    } catch (_) {
+      throw new Error(`${label}: server returned an invalid response`);
+    }
+
+    if (!res.ok) {
+      throw new Error(`${label}: ${json?.error || `HTTP ${res.status}`}`);
+    }
+
+    return { data: json, error: '' };
+  } catch (e) {
+    return {
+      data: null,
+      error: `${label}: ${e?.message || 'Failed to fetch'}`
+    };
+  }
+}
+
 export default function Dashboard() {
   const today = new Date();
   const d14 = new Date(today.getTime() - 13 * 24 * 3600 * 1000);
   const [start, setStart] = useState(d14.toISOString().slice(0, 10));
   const [end, setEnd] = useState(today.toISOString().slice(0, 10));
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
   const [settlements, setSettlements] = useState(null);
   const [refunds, setRefunds] = useState(null);
   const [reimbursements, setReimbursements] = useState(null);
+  const [sectionErrors, setSectionErrors] = useState({ settlements:'', refunds:'', reimbursements:'' });
 
   const settlementTotals = useMemo(() => {
     const rows = settlements?.rows || [];
@@ -27,31 +51,37 @@ export default function Dashboard() {
   }, [settlements]);
 
   async function load() {
-    setError('');
     setLoading(true);
+    setSectionErrors({ settlements:'', refunds:'', reimbursements:'' });
 
     try {
-      const [settlementRes, refundRes, reimbursementRes] = await Promise.all([
-        fetch(`/api/transactions?start=${start}&end=${end}`),
-        fetch(`/api/refunds?start=${start}&end=${end}`),
-        fetch(`/api/reimbursements?start=${start}&end=${end}`)
-      ]);
+      // Load sequentially to avoid three Gmail-heavy serverless requests competing at the same time.
+      const settlementResult = await fetchReport(
+        `/api/transactions?start=${start}&end=${end}`,
+        'Settlements'
+      );
+      if (settlementResult.data) setSettlements(settlementResult.data);
+      else setSettlements(null);
 
-      const [settlementJson, refundJson, reimbursementJson] = await Promise.all([
-        settlementRes.json(),
-        refundRes.json(),
-        reimbursementRes.json()
-      ]);
+      const refundResult = await fetchReport(
+        `/api/refunds?start=${start}&end=${end}`,
+        'Customer refunds'
+      );
+      if (refundResult.data) setRefunds(refundResult.data);
+      else setRefunds(null);
 
-      if (!settlementRes.ok) throw new Error(settlementJson.error || 'Failed to fetch settlements');
-      if (!refundRes.ok) throw new Error(refundJson.error || 'Failed to fetch customer refunds');
-      if (!reimbursementRes.ok) throw new Error(reimbursementJson.error || 'Failed to fetch Amazon reimbursements');
+      const reimbursementResult = await fetchReport(
+        `/api/reimbursements?start=${start}&end=${end}`,
+        'Amazon reimbursements'
+      );
+      if (reimbursementResult.data) setReimbursements(reimbursementResult.data);
+      else setReimbursements(null);
 
-      setSettlements(settlementJson);
-      setRefunds(refundJson);
-      setReimbursements(reimbursementJson);
-    } catch (e) {
-      setError(e.message || 'Failed to load dashboard');
+      setSectionErrors({
+        settlements: settlementResult.error,
+        refunds: refundResult.error,
+        reimbursements: reimbursementResult.error
+      });
     } finally {
       setLoading(false);
     }
@@ -80,27 +110,28 @@ export default function Dashboard() {
         </button>
       </div>
 
-      {error && <div style={{ color:'crimson', marginBottom:16 }}>Error: {error}</div>}
-
       <h2>Settlement Flow</h2>
+      {sectionErrors.settlements && <SectionError text={sectionErrors.settlements} />}
       <div style={grid}>
-        <MetricCard title="Amazon Disbursed" value={money(settlementTotals.amazon)} note="Amazon payment communication" />
-        <MetricCard title="Received in Virtual A/c" value={money(settlementTotals.virtual)} note="Funds received into virtual account" />
-        <MetricCard title="Released to BIGONBUY / ICICI" value={money(settlementTotals.icici)} note="Settlement released to company bank account" />
-        <MetricCard title="Released to Indifi" value={money(settlementTotals.indifi)} note="Settlement released to Indifi" />
+        <MetricCard title="Amazon Disbursed" value={money(settlementTotals.amazon)} note="Amazon payment communication" unavailable={!settlements} />
+        <MetricCard title="Received in Virtual A/c" value={money(settlementTotals.virtual)} note="Funds received into virtual account" unavailable={!settlements} />
+        <MetricCard title="Released to BIGONBUY / ICICI" value={money(settlementTotals.icici)} note="Settlement released to company bank account" unavailable={!settlements} />
+        <MetricCard title="Released to Indifi" value={money(settlementTotals.indifi)} note="Settlement released to Indifi" unavailable={!settlements} />
       </div>
 
       <h2 style={{ marginTop:30 }}>Customer Refunds</h2>
+      {sectionErrors.refunds && <SectionError text={sectionErrors.refunds} />}
       <div style={grid}>
-        <MetricCard title="Refunds Issued to Customers" value={money(refundAmount)} note="Amazon refund initiated communications to customers" />
-        <MetricCard title="Refund Emails" value={refundEmails} note="Distinct refund communications" />
-        <MetricCard title="Refunded Items" value={refundItems} note="Item rows parsed from refund emails" />
+        <MetricCard title="Refunds Issued to Customers" value={money(refundAmount)} note="Amazon refund initiated communications to customers" unavailable={!refunds} />
+        <MetricCard title="Refund Emails" value={refundEmails} note="Distinct refund communications" unavailable={!refunds} />
+        <MetricCard title="Refunded Items" value={refundItems} note="Item rows parsed from refund emails" unavailable={!refunds} />
       </div>
 
       <h2 style={{ marginTop:30 }}>Amazon Reimbursements to Us</h2>
+      {sectionErrors.reimbursements && <SectionError text={sectionErrors.reimbursements} />}
       <div style={grid}>
-        <MetricCard title="Reimbursements Credited by Amazon" value={money(reimbursementAmount)} note="Amounts Amazon has reimbursed to our seller account" />
-        <MetricCard title="Reimbursed Orders" value={reimbursementRows} note="Order reimbursement rows found in Amazon emails" />
+        <MetricCard title="Reimbursements Credited by Amazon" value={money(reimbursementAmount)} note="Amounts Amazon has reimbursed to our seller account" unavailable={!reimbursements} />
+        <MetricCard title="Reimbursed Orders" value={reimbursementRows} note="Order reimbursement rows found in Amazon emails" unavailable={!reimbursements} />
       </div>
 
       <div style={{ marginTop:30, padding:16, border:'1px solid #e5e7eb', borderRadius:10, background:'#fafafa' }}>
@@ -110,12 +141,20 @@ export default function Dashboard() {
   );
 }
 
-function MetricCard({ title, value, note }) {
+function MetricCard({ title, value, note, unavailable }) {
   return (
     <div style={{ border:'1px solid #e5e7eb', borderRadius:12, padding:18, background:'#fff' }}>
       <div style={{ color:'#555', fontSize:14, marginBottom:8 }}>{title}</div>
-      <div style={{ fontSize:28, fontWeight:700, marginBottom:8 }}>{value}</div>
-      <div style={{ color:'#777', fontSize:13 }}>{note}</div>
+      <div style={{ fontSize:28, fontWeight:700, marginBottom:8 }}>{unavailable ? '—' : value}</div>
+      <div style={{ color:'#777', fontSize:13 }}>{unavailable ? 'Data unavailable for this refresh' : note}</div>
+    </div>
+  );
+}
+
+function SectionError({ text }) {
+  return (
+    <div style={{ color:'crimson', background:'#fff7f7', border:'1px solid #ffd6d6', borderRadius:8, padding:'10px 12px', marginBottom:12 }}>
+      {text}
     </div>
   );
 }
