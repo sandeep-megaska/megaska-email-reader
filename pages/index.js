@@ -20,6 +20,13 @@ export default function Home() {
       </p>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 16 }}>
+        <Link href="/dashboard" style={card}>
+          <h2 style={{ marginTop: 0 }}>Finance Dashboard</h2>
+          <p style={{ color: '#555', marginBottom: 0 }}>
+            View settlement flows, customer refunds, and Amazon reimbursements in one overview.
+          </p>
+        </Link>
+
         <Link href="/settlements" style={card}>
           <h2 style={{ marginTop: 0 }}>Indifi Settlements</h2>
           <p style={{ color: '#555', marginBottom: 0 }}>
